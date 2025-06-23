@@ -426,6 +426,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 <body>
     <h1>Time API</h1>
     <p>A simple and efficient REST API for fetching current time information with timezone support.</p>
+    <p>GitHub Repository: <a href="https://github.com/petstack/time-api" target="_blank">https://github.com/petstack/time-api</a></p>
 
     <h2>API Endpoints</h2>
 
