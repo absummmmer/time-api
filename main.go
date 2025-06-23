@@ -374,6 +374,13 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func robotsTxtHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w, `User-agent: *
+Allow: /
+`)
+}
+
 func main() {
 	createTimeZoneList()
 
@@ -382,6 +389,7 @@ func main() {
 	http.HandleFunc("/v1/time", corsMiddleware(timeV1Handler))
 	http.HandleFunc("/v1/timezones", corsMiddleware(timezonesV1Handler))
 	http.HandleFunc("/v1/openapi.json", corsMiddleware(openAPIV1Handler))
+	http.HandleFunc("/robots.txt", robotsTxtHandler)
 
 	// Start the server
 	port := 8080
