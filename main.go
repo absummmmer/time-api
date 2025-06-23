@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"sort"
 	"strings"
@@ -459,6 +460,11 @@ func main() {
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Generate a unique request ID
+			requestID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Intn(1000000))
+			// Add X-Request-ID header
+			w.Header().Set("X-Request-ID", requestID)
+
 			// Check if the path exists in our mux
 			h, pattern := mux.Handler(r)
 			if pattern != r.URL.Path {
