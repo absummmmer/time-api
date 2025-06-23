@@ -3,15 +3,120 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	timezone "github.com/tkuchiki/go-timezone"
 )
+
+// LogEntry represents a structured log entry
+type LogEntry struct {
+	Timestamp string      `json:"timestamp"`
+	Level     string      `json:"level"`
+	RequestID string      `json:"request_id,omitempty"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+}
+
+// JSONLogger is a custom logger that outputs JSON formatted logs
+type JSONLogger struct {
+	writer io.Writer
+}
+
+// Logger is a global logger instance
+var Logger *JSONLogger
+
+// NewJSONLogger creates a new JSON logger
+func NewJSONLogger(w io.Writer) *JSONLogger {
+	return &JSONLogger{writer: w}
+}
+
+// logWithLevel logs a message with the specified level
+func (l *JSONLogger) logWithLevel(level, requestID, message string, data interface{}) {
+	entry := LogEntry{
+		Timestamp: time.Now().Format(time.RFC3339Nano),
+		Level:     level,
+		Message:   message,
+		Data:      data,
+	}
+
+	if requestID != "" {
+		entry.RequestID = requestID
+	}
+
+	jsonData, err := json.Marshal(entry)
+	if err != nil {
+		// Fallback to basic logging if JSON marshaling fails
+		log.Printf("Error marshaling log entry: %v", err)
+		return
+	}
+
+	// Add newline for better readability
+	jsonData = append(jsonData, '\n')
+
+	_, err = l.writer.Write(jsonData)
+	if err != nil {
+		log.Printf("Error writing log entry: %v", err)
+	}
+}
+
+// Info logs an informational message
+func (l *JSONLogger) Info(requestID, message string, data ...interface{}) {
+	var dataObj interface{}
+	if len(data) == 1 {
+		dataObj = data[0]
+	} else if len(data) > 1 {
+		dataObj = data
+	}
+	l.logWithLevel("info", requestID, message, dataObj)
+}
+
+// Error logs an error message
+func (l *JSONLogger) Error(requestID, message string, data ...interface{}) {
+	var dataObj interface{}
+	if len(data) == 1 {
+		dataObj = data[0]
+	} else if len(data) > 1 {
+		dataObj = data
+	}
+	l.logWithLevel("error", requestID, message, dataObj)
+}
+
+// Fatal logs a fatal error message and exits the program
+func (l *JSONLogger) Fatal(v ...interface{}) {
+	message := fmt.Sprint(v...)
+	l.logWithLevel("fatal", "", message, nil)
+	os.Exit(1)
+}
+
+// Printf is provided for compatibility with the standard logger
+func (l *JSONLogger) Printf(format string, v ...interface{}) {
+	message := fmt.Sprintf(format, v...)
+
+	// Extract request ID if present
+	requestID := ""
+	if len(message) > 0 && message[0] == '[' {
+		endIdx := strings.Index(message, "]")
+		if endIdx > 0 {
+			requestID = message[1:endIdx]
+			message = strings.TrimSpace(message[endIdx+1:])
+		}
+	}
+
+	l.logWithLevel("info", requestID, message, nil)
+}
+
+// Println is provided for compatibility with the standard logger
+func (l *JSONLogger) Println(v ...interface{}) {
+	message := fmt.Sprint(v...)
+	l.logWithLevel("info", "", message, nil)
+}
 
 // TimeResponse represents the response structure for the time endpoint
 type TimeResponse struct {
@@ -220,11 +325,17 @@ func timeV1Handler(w http.ResponseWriter, r *http.Request) {
 		tzName = "UTC"
 	}
 
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+
+	Logger.Printf("[%s] Processing time request with timezone: %s", requestID, tzName)
+
 	tz := timezone.New()
 
 	now, err := tz.FixedTimezone(time.Now(), tzName)
 	if err != nil {
 		// If timezone is invalid, return 400 Bad Request
+		Logger.Printf("[%s] Error: Invalid timezone '%s': %v", requestID, tzName, err)
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid timezone"})
 		return
@@ -242,25 +353,45 @@ func timeV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return the response
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		Logger.Printf("[%s] Error encoding response: %v", requestID, err)
+	}
 }
 
 func timezonesV1Handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+	Logger.Printf("[%s] Processing timezones request", requestID)
+
 	response := TimezonesResponse{
 		Timezones: timezones,
 	}
 
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		Logger.Printf("[%s] Error encoding timezones response: %v", requestID, err)
+	}
 }
 
 func openAPIV1Handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, openAPISpec)
+
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+	Logger.Printf("[%s] Processing OpenAPI spec request", requestID)
+
+	_, err := fmt.Fprint(w, openAPISpec)
+	if err != nil {
+		Logger.Printf("[%s] Error writing OpenAPI spec: %v", requestID, err)
+	}
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+	Logger.Printf("[%s] Processing root page request", requestID)
+
 	html := `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -359,7 +490,10 @@ Access-Control-Allow-Headers: Content-Type</pre>
 </html>`
 
 	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, html)
+	_, err := fmt.Fprint(w, html)
+	if err != nil {
+		Logger.Printf("[%s] Error writing HTML response: %v", requestID, err)
+	}
 }
 
 // corsMiddleware adds CORS headers to GET requests
@@ -376,16 +510,28 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func robotsTxtHandler(w http.ResponseWriter, r *http.Request) {
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+	Logger.Printf("[%s] Processing robots.txt request", requestID)
+
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprint(w, `User-agent: *
+	_, err := fmt.Fprint(w, `User-agent: *
 Allow: /
 `)
+	if err != nil {
+		Logger.Printf("[%s] Error writing robots.txt response: %v", requestID, err)
+	}
 }
 
 // notFoundHandler handles 404 errors and returns different formats based on Accept header
 func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	// Get request ID for logging
+	requestID := w.Header().Get("X-Request-ID")
+	Logger.Printf("[%s] 404 Not Found: %s %s", requestID, r.Method, r.URL.Path)
+
 	// Check Accept header to determine response format
 	accept := r.Header.Get("Accept")
+	Logger.Printf("[%s] Accept header: %s", requestID, accept)
 
 	// If Accept header contains text/html, return HTML response
 	if accept != "" && (strings.Contains(accept, "text/html") || accept == "*/*" || strings.Contains(accept, "text/*")) {
@@ -431,7 +577,11 @@ func notFoundHandler(w http.ResponseWriter, r *http.Request) {
     <p><a href="/">Return to Home</a></p>
 </body>
 </html>`
-		fmt.Fprint(w, html)
+		_, err := fmt.Fprint(w, html)
+		if err != nil {
+			Logger.Printf("[%s] Error writing HTML 404 response: %v", requestID, err)
+		}
+		Logger.Printf("[%s] Returned HTML 404 response", requestID)
 		return
 	}
 
@@ -439,11 +589,67 @@ func notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	// Set status code after all headers are set
 	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: "Page not found"})
+	err := json.NewEncoder(w).Encode(ErrorResponse{Error: "Page not found"})
+	if err != nil {
+		Logger.Printf("[%s] Error encoding JSON 404 response: %v", requestID, err)
+	}
+	Logger.Printf("[%s] Returned JSON 404 response", requestID)
+}
+
+// loggingMiddleware logs HTTP requests with details
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Create a response wrapper to capture the status code
+		rw := &responseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK, // Default to 200 OK
+		}
+
+		// Get the request ID from the header (if already set)
+		requestID := w.Header().Get("X-Request-ID")
+		if requestID == "" {
+			requestID = "unknown"
+		}
+
+		// Log the request
+		Logger.Printf("[%s] Request: %s %s %s", requestID, r.Method, r.URL.Path, r.RemoteAddr)
+
+		// Call the next handler
+		next.ServeHTTP(rw, r)
+
+		// Log the response
+		duration := time.Since(start)
+		Logger.Printf("[%s] Response: %s %s - %d %s - %v",
+			requestID,
+			r.Method,
+			r.URL.Path,
+			rw.statusCode,
+			http.StatusText(rw.statusCode),
+			duration)
+	})
+}
+
+// responseWriter is a wrapper for http.ResponseWriter that captures the status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// WriteHeader captures the status code before writing it
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 func main() {
+	// Initialize the logger
+	Logger = NewJSONLogger(os.Stdout)
+	Logger.Println("Initializing Time API server...")
+
 	createTimeZoneList()
+	Logger.Printf("Loaded %d timezones", len(timezones))
 
 	// Create a custom mux with our notFoundHandler
 	mux := http.NewServeMux()
@@ -457,6 +663,8 @@ func main() {
 
 	// Create a custom server with our mux
 	port := 8080
+	Logger.Printf("Configuring server on port %d", port)
+
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", port),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -472,11 +680,12 @@ func main() {
 				return
 			}
 
-			h.ServeHTTP(w, r)
+			// Apply logging middleware
+			loggingMiddleware(h).ServeHTTP(w, r)
 		}),
 	}
 
 	// Start the server
-	log.Printf("Server starting on port %d...", port)
-	log.Fatal(server.ListenAndServe())
+	Logger.Printf("Server starting on port %d...", port)
+	Logger.Fatal(server.ListenAndServe())
 }
