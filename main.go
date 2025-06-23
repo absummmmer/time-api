@@ -611,20 +611,22 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Log the request
-		Logger.Printf("[%s] Request: %s %s %s", requestID, r.Method, r.URL.Path, r.RemoteAddr)
+		Logger.Printf("[%s] Request: %s %s - IP: %s - User-Agent: %s", requestID, r.Method, r.URL.Path, r.RemoteAddr, r.Header.Get("User-Agent"))
 
 		// Call the next handler
 		next.ServeHTTP(rw, r)
 
 		// Log the response
 		duration := time.Since(start)
-		Logger.Printf("[%s] Response: %s %s - %d %s - %v",
+		Logger.Printf("[%s] Response: %s %s - %d %s - %v - IP: %s - User-Agent: %s",
 			requestID,
 			r.Method,
 			r.URL.Path,
 			rw.statusCode,
 			http.StatusText(rw.statusCode),
-			duration)
+			duration,
+			r.RemoteAddr,
+			r.Header.Get("User-Agent"))
 	})
 }
 
