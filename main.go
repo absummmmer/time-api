@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
@@ -15,18 +16,9 @@ import (
 	timezone "github.com/tkuchiki/go-timezone"
 )
 
-// LogEntry represents a structured log entry
-type LogEntry struct {
-	Timestamp string      `json:"timestamp"`
-	Level     string      `json:"level"`
-	RequestID string      `json:"request_id,omitempty"`
-	Message   string      `json:"message"`
-	Data      interface{} `json:"data,omitempty"`
-}
-
-// JSONLogger is a custom logger that outputs JSON formatted logs
+// JSONLogger is a wrapper around slog.Logger that provides compatibility with our existing code
 type JSONLogger struct {
-	writer io.Writer
+	logger *slog.Logger
 }
 
 // Logger is a global logger instance
@@ -34,64 +26,64 @@ var Logger *JSONLogger
 
 // NewJSONLogger creates a new JSON logger
 func NewJSONLogger(w io.Writer) *JSONLogger {
-	return &JSONLogger{writer: w}
-}
-
-// logWithLevel logs a message with the specified level
-func (l *JSONLogger) logWithLevel(level, requestID, message string, data interface{}) {
-	entry := LogEntry{
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-		Level:     level,
-		Message:   message,
-		Data:      data,
+	// Create a JSON handler with time in RFC3339Nano format
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Format timestamp as RFC3339Nano
+			if a.Key == slog.TimeKey {
+				return slog.Attr{
+					Key:   a.Key,
+					Value: slog.StringValue(a.Value.Time().Format(time.RFC3339Nano)),
+				}
+			}
+			return a
+		},
 	}
+	handler := slog.NewJSONHandler(w, opts)
+	logger := slog.New(handler)
 
-	if requestID != "" {
-		entry.RequestID = requestID
-	}
-
-	jsonData, err := json.Marshal(entry)
-	if err != nil {
-		// Fallback to basic logging if JSON marshaling fails
-		log.Printf("Error marshaling log entry: %v", err)
-		return
-	}
-
-	// Add newline for better readability
-	jsonData = append(jsonData, '\n')
-
-	_, err = l.writer.Write(jsonData)
-	if err != nil {
-		log.Printf("Error writing log entry: %v", err)
-	}
+	return &JSONLogger{logger: logger}
 }
 
 // Info logs an informational message
 func (l *JSONLogger) Info(requestID, message string, data ...interface{}) {
-	var dataObj interface{}
-	if len(data) == 1 {
-		dataObj = data[0]
-	} else if len(data) > 1 {
-		dataObj = data
+	attrs := []slog.Attr{}
+
+	if requestID != "" {
+		attrs = append(attrs, slog.String("request_id", requestID))
 	}
-	l.logWithLevel("info", requestID, message, dataObj)
+
+	if len(data) == 1 {
+		attrs = append(attrs, slog.Any("data", data[0]))
+	} else if len(data) > 1 {
+		attrs = append(attrs, slog.Any("data", data))
+	}
+
+	l.logger.LogAttrs(context.Background(), slog.LevelInfo, message, attrs...)
 }
 
 // Error logs an error message
 func (l *JSONLogger) Error(requestID, message string, data ...interface{}) {
-	var dataObj interface{}
-	if len(data) == 1 {
-		dataObj = data[0]
-	} else if len(data) > 1 {
-		dataObj = data
+	attrs := []slog.Attr{}
+
+	if requestID != "" {
+		attrs = append(attrs, slog.String("request_id", requestID))
 	}
-	l.logWithLevel("error", requestID, message, dataObj)
+
+	if len(data) == 1 {
+		attrs = append(attrs, slog.Any("data", data[0]))
+	} else if len(data) > 1 {
+		attrs = append(attrs, slog.Any("data", data))
+	}
+
+	l.logger.LogAttrs(context.Background(), slog.LevelError, message, attrs...)
 }
 
 // Fatal logs a fatal error message and exits the program
 func (l *JSONLogger) Fatal(v ...interface{}) {
 	message := fmt.Sprint(v...)
-	l.logWithLevel("fatal", "", message, nil)
+	l.logger.LogAttrs(context.Background(), slog.LevelError, message, slog.String("level", "fatal"))
 	os.Exit(1)
 }
 
@@ -109,13 +101,18 @@ func (l *JSONLogger) Printf(format string, v ...interface{}) {
 		}
 	}
 
-	l.logWithLevel("info", requestID, message, nil)
+	attrs := []slog.Attr{}
+	if requestID != "" {
+		attrs = append(attrs, slog.String("request_id", requestID))
+	}
+
+	l.logger.LogAttrs(context.Background(), slog.LevelInfo, message, attrs...)
 }
 
 // Println is provided for compatibility with the standard logger
 func (l *JSONLogger) Println(v ...interface{}) {
 	message := fmt.Sprint(v...)
-	l.logWithLevel("info", "", message, nil)
+	l.logger.Info(message)
 }
 
 // TimeResponse represents the response structure for the time endpoint
