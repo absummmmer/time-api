@@ -6,7 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
-	"strconv"
+	"strings"
 	"time"
 
 	timezone "github.com/tkuchiki/go-timezone"
@@ -381,18 +381,96 @@ Allow: /
 `)
 }
 
+// notFoundHandler handles 404 errors and returns different formats based on Accept header
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	// Check Accept header to determine response format
+	accept := r.Header.Get("Accept")
+
+	// If Accept header contains text/html, return HTML response
+	if accept != "" && (strings.Contains(accept, "text/html") || accept == "*/*" || strings.Contains(accept, "text/*")) {
+		w.Header().Set("Content-Type", "text/html")
+		// Set status code after all headers are set
+		w.WriteHeader(http.StatusNotFound)
+		html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>404 - Page Not Found</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        h1 {
+            color: #333;
+            font-size: 36px;
+            margin-bottom: 20px;
+        }
+        p {
+            font-size: 18px;
+            margin-bottom: 30px;
+        }
+        a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>404 - Page Not Found</h1>
+    <p>The page you are looking for does not exist.</p>
+    <p><a href="/">Return to Home</a></p>
+</body>
+</html>`
+		fmt.Fprint(w, html)
+		return
+	}
+
+	// Default to JSON response
+	w.Header().Set("Content-Type", "application/json")
+	// Set status code after all headers are set
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: "Page not found"})
+}
+
 func main() {
 	createTimeZoneList()
 
+	// Create a custom mux with our notFoundHandler
+	mux := http.NewServeMux()
+
 	// Register handlers with CORS middleware
-	http.HandleFunc("/", corsMiddleware(rootHandler))
-	http.HandleFunc("/v1/time", corsMiddleware(timeV1Handler))
-	http.HandleFunc("/v1/timezones", corsMiddleware(timezonesV1Handler))
-	http.HandleFunc("/v1/openapi.json", corsMiddleware(openAPIV1Handler))
-	http.HandleFunc("/robots.txt", robotsTxtHandler)
+	mux.HandleFunc("/", rootHandler)
+	mux.HandleFunc("/v1/time", corsMiddleware(timeV1Handler))
+	mux.HandleFunc("/v1/timezones", corsMiddleware(timezonesV1Handler))
+	mux.HandleFunc("/v1/openapi.json", corsMiddleware(openAPIV1Handler))
+	mux.HandleFunc("/robots.txt", robotsTxtHandler)
+
+	// Create a custom server with our mux
+	port := 8080
+	server := &http.Server{
+		Addr: fmt.Sprintf(":%d", port),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Check if the path exists in our mux
+			h, pattern := mux.Handler(r)
+			if pattern != r.URL.Path {
+				notFoundHandler(w, r)
+				return
+			}
+
+			h.ServeHTTP(w, r)
+		}),
+	}
 
 	// Start the server
-	port := 8080
 	log.Printf("Server starting on port %d...", port)
-	log.Fatal(http.ListenAndServe(":"+strconv.Itoa(port), nil))
+	log.Fatal(server.ListenAndServe())
 }
