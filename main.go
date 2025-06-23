@@ -347,6 +347,13 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         <code>GET /v1/openapi.json</code>
         <p>Returns the OpenAPI specification for the API.</p>
     </div>
+
+    <h2>CORS Support</h2>
+    <p>All API endpoints support Cross-Origin Resource Sharing (CORS) for GET requests. The following CORS headers are included in all GET responses:</p>
+    <pre>Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET
+Access-Control-Allow-Headers: Content-Type</pre>
+    <p>This allows the API to be accessed from any domain using GET requests.</p>
 </body>
 </html>`
 
@@ -354,14 +361,27 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, html)
 }
 
+// corsMiddleware adds CORS headers to GET requests
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Add CORS headers for GET requests
+		if r.Method == http.MethodGet {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
+		next(w, r)
+	}
+}
+
 func main() {
 	createTimeZoneList()
 
-	// Register handlers
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/v1/time", timeV1Handler)
-	http.HandleFunc("/v1/timezones", timezonesV1Handler)
-	http.HandleFunc("/v1/openapi.json", openAPIV1Handler)
+	// Register handlers with CORS middleware
+	http.HandleFunc("/", corsMiddleware(rootHandler))
+	http.HandleFunc("/v1/time", corsMiddleware(timeV1Handler))
+	http.HandleFunc("/v1/timezones", corsMiddleware(timezonesV1Handler))
+	http.HandleFunc("/v1/openapi.json", corsMiddleware(openAPIV1Handler))
 
 	// Start the server
 	port := 8080

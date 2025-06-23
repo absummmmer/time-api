@@ -8,6 +8,7 @@ A simple and efficient REST API for fetching current time information with timez
 - Support for multiple timezones
 - List all available timezones
 - OpenAPI documentation
+- CORS support for all endpoints (GET methods)
 
 ## Installation
 
@@ -105,6 +106,18 @@ GET /v1/openapi.json
 ```
 
 Returns the OpenAPI specification for the API.
+
+### CORS Support
+
+All API endpoints support Cross-Origin Resource Sharing (CORS) for GET requests. The following CORS headers are included in all GET responses:
+
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET
+Access-Control-Allow-Headers: Content-Type
+```
+
+This allows the API to be accessed from any domain using GET requests.
 
 ## License
 
