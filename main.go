@@ -259,10 +259,106 @@ func openAPIV1Handler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, openAPISpec)
 }
 
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Time API Documentation</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2 {
+            color: #333;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        .endpoint {
+            margin-bottom: 30px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Time API</h1>
+    <p>A simple and efficient REST API for fetching current time information with timezone support.</p>
+
+    <h2>API Endpoints</h2>
+
+    <div class="endpoint">
+        <h3>Get Current Time</h3>
+        <code>GET /v1/time?timezone={timezone}</code>
+        <p>Parameters:</p>
+        <ul>
+            <li><code>timezone</code> (optional): Timezone to get the time for (e.g., 'UTC', 'Europe/London'). Defaults to 'UTC'.</li>
+        </ul>
+        <p>Example Response:</p>
+        <pre>{
+  "timestamp": 1634567890,
+  "time": "10:13:44.323435",
+  "date": "2021-10-18",
+  "timezone": "UTC",
+  "abbr": "GMT",
+  "offset": "+00:00",
+  "iso8601": "2021-10-18T10:13:44+00:00"
+}</pre>
+    </div>
+
+    <div class="endpoint">
+        <h3>List Available Timezones</h3>
+        <code>GET /v1/timezones</code>
+        <p>Example Response:</p>
+        <pre>{
+  "timezones": [
+    {
+      "name": "Africa/Abidjan",
+      "abbr": "GMT"
+    },
+    {
+      "name": "Africa/Accra",
+      "abbr": "GMT"
+    },
+    {
+      "name": "Europe/London",
+      "abbr": "BST"
+    }
+    // ... more timezones
+  ]
+}</pre>
+    </div>
+
+    <div class="endpoint">
+        <h3>OpenAPI Documentation</h3>
+        <code>GET /v1/openapi.json</code>
+        <p>Returns the OpenAPI specification for the API.</p>
+    </div>
+</body>
+</html>`
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, html)
+}
+
 func main() {
 	createTimeZoneList()
 
 	// Register handlers
+	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/v1/time", timeV1Handler)
 	http.HandleFunc("/v1/timezones", timezonesV1Handler)
 	http.HandleFunc("/v1/openapi.json", openAPIV1Handler)
