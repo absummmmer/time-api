@@ -594,6 +594,26 @@ func notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	Logger.Printf("[%s] Returned JSON 404 response", requestID)
 }
 
+// getClientIP gets the client IP from headers or remote address
+func getClientIP(r *http.Request) string {
+	// First check DO-Connecting-IP header
+	if ip := r.Header.Get("DO-Connecting-IP"); ip != "" {
+		return ip
+	}
+
+	// Then check X-Forwarded-For header
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		// X-Forwarded-For can contain multiple IPs, use the first one
+		ips := strings.Split(ip, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	// Fall back to RemoteAddr
+	return r.RemoteAddr
+}
+
 // loggingMiddleware logs HTTP requests with details
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -611,8 +631,11 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			requestID = "unknown"
 		}
 
+		// Get client IP using the helper function
+		clientIP := getClientIP(r)
+
 		// Log the request
-		Logger.Printf("[%s] Request: %s %s - IP: %s - User-Agent: %s", requestID, r.Method, r.URL.Path, r.RemoteAddr, r.Header.Get("User-Agent"))
+		Logger.Printf("[%s] Request: %s %s - IP: %s - User-Agent: %s", requestID, r.Method, r.URL.Path, clientIP, r.Header.Get("User-Agent"))
 
 		// Call the next handler
 		next.ServeHTTP(rw, r)
@@ -626,7 +649,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			rw.statusCode,
 			http.StatusText(rw.statusCode),
 			duration,
-			r.RemoteAddr,
+			clientIP,
 			r.Header.Get("User-Agent"))
 	})
 }
