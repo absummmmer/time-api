@@ -1,10 +1,15 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
+# Prefer the China mirror, then the official proxy, then direct downloads.
+# The pipe separator makes the go command fall back on any network error.
+ENV GOPROXY=https://goproxy.cn|https://proxy.golang.org|direct
+
 WORKDIR /app
 
-# Copy go mod and sum files
-COPY go.mod ./
+# Copy go.mod and go.sum so dependency downloads can be verified against the
+# committed checksums and cached by Docker.
+COPY go.mod go.sum ./
 
 # Download all dependencies
 RUN go mod download
@@ -18,8 +23,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o time-api .
 # Final stage
 FROM alpine:latest
 
-# Install tzdata package for timezone support
-RUN apk add --no-cache tzdata
+# Install tzdata for timezone support and CA certificates so that the DUT1
+# provider can fetch the upstream HTTPS data source.
+RUN apk add --no-cache tzdata ca-certificates
 
 WORKDIR /root/
 

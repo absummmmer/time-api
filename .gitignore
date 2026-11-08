@@ -17,6 +17,10 @@
 # Go workspace file
 go.work
 
+# Local environment overrides
+.env
+*.log
+
 # Binary built by go build
 /main
 

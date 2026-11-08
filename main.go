@@ -117,13 +117,18 @@ func (l *JSONLogger) Println(v ...interface{}) {
 
 // TimeResponse represents the response structure for the time endpoint
 type TimeResponse struct {
-	Timestamp int64  `json:"timestamp"`
-	Time      string `json:"time"`
-	Date      string `json:"date"`
-	Timezone  string `json:"timezone"`
-	Abbr      string `json:"abbr"`
-	Offset    string `json:"offset"`
-	ISO8601   string `json:"iso8601"`
+	Timestamp              int64     `json:"timestamp"`
+	Time                   string    `json:"time"`
+	Date                   string    `json:"date"`
+	Timezone               string    `json:"timezone"`
+	Abbr                   string    `json:"abbr"`
+	Offset                 string    `json:"offset"`
+	ISO8601                string    `json:"iso8601"`
+	ServerReceivedMs       int64     `json:"server_received_ms"`
+	ServerSentMs           int64     `json:"server_sent_ms"`
+	ClockSource            string    `json:"clock_source"`
+	ClockCorrectionApplied bool      `json:"clock_correction_applied"`
+	DUT1                   *DUT1Info `json:"dut1,omitempty"`
 }
 
 type Timezone struct {
@@ -140,6 +145,10 @@ type ErrorResponse struct {
 }
 
 var timezones []Timezone
+
+// dut1 is the process-wide DUT1 cache. It is initialised in main.
+var dut1 *dut1Service
+var dut1NTSC *dut1Service
 
 func createTimeZoneList() {
 	tz := timezone.New()
@@ -219,6 +228,99 @@ const openAPISpec = `{
         }
       }
     },
+    "/time/ntp": {
+      "get": {
+        "summary": "Get compact NTP-oriented time and backend clock health",
+        "description": "Microsecond server timestamps plus upstream NTP monitor status for browser four-timestamp synchronization. Pass server=<domain> for a one-off probe of another public NTP server; this does not change the main monitor. Pass refresh=1 to query the configured monitor source immediately.",
+        "parameters": [
+          {
+            "name": "server",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"},
+            "description": "Optional public DNS name for a one-off NTP probe. IP literals and private/local names are rejected. Rate limited."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "boolean"},
+            "description": "Refresh the configured monitor once before returning. Do not combine with server. Rate limited."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Compact time transfer response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NTPTimeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid NTP probe target or conflicting parameters"
+          },
+          "429": {
+            "description": "NTP probe rate limit"
+          },
+          "503": {
+            "description": "NTP monitor disabled"
+          }
+        }
+      }
+    },
+    "/dut1": {
+      "get": {
+        "summary": "Get DUT1 (UT1-UTC) for a UTC date and its neighbours",
+        "description": "Returns the published UT1-UTC values for the requested UTC date, the day before and the day after. Values that have not yet been observed are marked as predicted. The source can be auto (prefer fresh NTSC, then IERS), ntsc, or iers.",
+        "parameters": [
+          {
+            "name": "date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "description": "UTC date in YYYY-MM-DD format. Defaults to the current UTC date."
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["auto", "ntsc", "iers"]
+            },
+            "description": "DUT1 source selection. Defaults to DUT1_DEFAULT_SOURCE or auto."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DUT1 values for the requested date and its neighbours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DUT1Info"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid date provided",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/timezones": {
       "get": {
         "summary": "List available timezones",
@@ -284,9 +386,329 @@ const openAPISpec = `{
             "type": "string",
             "example": "2004-02-12T15:19:21+00:00",
             "description": "Date and time in ISO 8601 format"
+          },
+          "server_received_ms": {
+            "type": "integer",
+            "description": "Server receive time as Unix milliseconds; used for four-timestamp clock offset estimation"
+          },
+          "server_sent_ms": {
+            "type": "integer",
+            "description": "Server send time as Unix milliseconds; used for four-timestamp clock offset estimation"
+          },
+          "clock_source": {
+            "type": "string",
+            "enum": ["host"],
+            "description": "This endpoint always serves the raw host clock"
+          },
+          "clock_correction_applied": {
+            "type": "boolean",
+            "description": "Always false for /v1/time; use /v1/time/ntp for monitored correction metadata"
+          },
+          "dut1": {
+            "$ref": "#/components/schemas/DUT1Info"
           }
         },
         "required": ["timestamp", "time", "date", "timezone", "abbr", "offset", "iso8601"]
+      },
+      "NTPTimeResponse": {
+        "type": "object",
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic per-process response counter"
+          },
+          "server_received_unix_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Server receive time as Unix microseconds"
+          },
+          "server_sent_unix_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Server send time as Unix microseconds"
+          },
+          "server_received_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Server receive time as Unix milliseconds"
+          },
+          "server_sent_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Server send time as Unix milliseconds"
+          },
+          "host_received_unix_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Raw host receive time before NTP correction"
+          },
+          "host_sent_unix_us": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Raw host send time before NTP correction"
+          },
+          "host_received_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "host_sent_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "clock_correction_ms": {
+            "type": "number",
+            "description": "NTP-host bias applied to server timestamps; zero when not applied"
+          },
+          "clock_correction_applied": {
+            "type": "boolean"
+          },
+          "clock_correction_eligible": {
+            "type": "boolean",
+            "description": "True when the configured correction policy allows this source"
+          },
+          "clock_correction_mode": {
+            "type": "string",
+            "enum": ["first", "off"],
+            "description": "configured correction policy; first means only the first configured source"
+          },
+          "clock_correction_source": {
+            "type": "string",
+            "description": "source that supplied the correction decision"
+          },
+          "clock_correction_reason": {
+            "type": "string",
+            "description": "machine-readable reason such as primary_synchronized, fallback_source, offset_gate, probe_only"
+          },
+          "clock_source": {
+            "type": "string",
+            "enum": ["host", "host+first-source"],
+            "description": "Which clock basis produced server_received/server_sent"
+          },
+          "clock_correction_uncertainty_ms": {
+            "type": "number"
+          },
+          "date": {
+            "type": "string",
+            "example": "2026-11-02"
+          },
+          "time": {
+            "type": "string",
+            "example": "12:30:14.701234"
+          },
+          "probe": {
+            "type": "boolean",
+            "description": "True when this response came from a one-off ?server= probe"
+          },
+          "refreshed": {
+            "type": "boolean",
+            "description": "True when this response came from an explicit ?refresh=1 monitor refresh"
+          },
+          "clock_health": {
+            "$ref": "#/components/schemas/NTPHealth"
+          }
+        },
+        "required": ["sequence", "server_received_unix_us", "server_sent_unix_us", "date", "time", "clock_health"]
+      },
+      "NTPSourceHealth": {
+        "type": "object",
+        "properties": {
+          "server": { "type": "string" },
+          "resolved_ip": { "type": "string", "description": "IP address actually probed for this DNS name" },
+          "reachable": { "type": "boolean" },
+          "selected": { "type": "boolean" },
+          "offset_ms": { "type": "number" },
+          "uncertainty_ms": { "type": "number" },
+          "rtt_ms": { "type": "number" },
+          "stratum": { "type": "integer" },
+          "offset_ok": { "type": "boolean" },
+          "quality_ok": { "type": "boolean" },
+          "root_delay_ms": { "type": "number" },
+          "root_dispersion_ms": { "type": "number" },
+          "leap": { "type": "integer" },
+          "last_success_at": { "type": "string" },
+          "last_attempt_at": { "type": "string" },
+          "age_s": { "type": "number" },
+          "consecutive_failures": { "type": "integer" },
+          "reach": { "type": "integer" },
+          "reach_octal": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "NTPHealth": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "server": { "type": "string" },
+          "servers": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Configured priority list"
+          },
+          "sources": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/NTPSourceHealth" },
+            "description": "Per-source observations from the latest poll"
+          },
+          "fallback": {
+            "type": "boolean",
+            "description": "True when the selected source is not the first configured source"
+          },
+          "reachable": { "type": "boolean" },
+          "synchronized": { "type": "boolean" },
+          "holdover": { "type": "boolean" },
+          "has_sample": { "type": "boolean" },
+          "offset_ok": { "type": "boolean" },
+          "quality_ok": { "type": "boolean" },
+          "offset_ms": { "type": "number" },
+          "uncertainty_ms": { "type": "number" },
+          "rtt_ms": { "type": "number" },
+          "stratum": { "type": "integer" },
+          "leap": { "type": "integer" },
+          "ref_id": { "type": "string" },
+          "root_delay_ms": { "type": "number" },
+          "root_dispersion_ms": { "type": "number" },
+          "last_success_at": { "type": "string" },
+          "last_attempt_at": { "type": "string" },
+          "resolved_ip": { "type": "string", "description": "IP address used for the selected source" },
+          "age_s": { "type": "number" },
+          "error": { "type": "string" }
+        },
+        "required": ["enabled", "server", "reachable", "synchronized", "holdover", "has_sample"]
+      },
+      "DUT1Point": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "example": "2026-10-18",
+            "description": "UTC date in YYYY-MM-DD format"
+          },
+          "mjd": {
+            "type": "integer",
+            "example": 61331,
+            "description": "Modified Julian Date"
+          },
+          "value": {
+            "type": "number",
+            "example": -0.03825,
+            "description": "UT1-UTC in seconds"
+          },
+          "dut1": {
+            "type": "number",
+            "example": 0.0,
+            "description": "UT1-UTC rounded to the 0.1 s DUT1 step used by time signals"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["observed", "predicted"],
+            "description": "Whether the value is an observed measurement or a prediction"
+          }
+        },
+        "required": ["date", "value", "dut1", "type"]
+      },
+      "DUT1Info": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "example": "2026-10-18",
+            "description": "Requested UTC date"
+          },
+          "date_basis": {
+            "type": "string",
+            "example": "UTC",
+            "description": "Calendar basis of the date fields"
+          },
+          "unit": {
+            "type": "string",
+            "example": "s",
+            "description": "Unit of the value fields (seconds)"
+          },
+          "source": {
+            "type": "string",
+            "example": "IERS Bulletin A",
+            "description": "Name of the upstream DUT1 source"
+          },
+          "source_key": {
+            "type": "string",
+            "enum": ["ntsc", "iers"],
+            "description": "Stable identifier of the upstream DUT1 source"
+          },
+          "source_mode": {
+            "type": "string",
+            "enum": ["auto", "ntsc", "iers"],
+            "description": "Requested source selection mode"
+          },
+          "source_url": {
+            "type": "string",
+            "description": "URL of the upstream data file"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time of the most recent successful refresh"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "True when the cached data is older than the configured threshold"
+          },
+          "available": {
+            "type": "boolean",
+            "description": "True when a value for the requested date is available"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "current": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "next": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "alternate": {
+            "$ref": "#/components/schemas/DUT1SourceSnapshot"
+          },
+          "error": {
+            "type": "string",
+            "description": "Human-readable reason when DUT1 data is unavailable"
+          }
+        },
+        "required": ["date", "date_basis", "unit", "source", "stale", "available"]
+      },
+      "DUT1SourceSnapshot": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Alternate upstream source name"
+          },
+          "source_key": {
+            "type": "string",
+            "enum": ["ntsc", "iers"]
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "current": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "next": {
+            "$ref": "#/components/schemas/DUT1Point"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
       },
       "ErrorResponse": {
         "type": "object",
@@ -314,6 +736,8 @@ const openAPISpec = `{
 func timeV1Handler(w http.ResponseWriter, r *http.Request) {
 	// Set content type
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	received := time.Now().UTC()
 
 	// Get timezone from query parameters, default to UTC
 	tzName := r.URL.Query().Get("timezone")
@@ -339,14 +763,26 @@ func timeV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Format the response
+	var dut1Info *DUT1Info
+	if dut1 != nil || dut1NTSC != nil {
+		info := dut1InfoFor(now, "")
+		dut1Info = &info
+	}
+
+	sent := time.Now().UTC()
 	response := TimeResponse{
-		Timestamp: now.Unix(),
-		Time:      now.Format("15:04:05.999999"),
-		Date:      now.Format("2006-01-02"),
-		Timezone:  tzName,
-		Abbr:      tz.TzInfos()[tzName].ShortStandard(),
-		Offset:    tz.TzInfos()[tzName].StandardOffsetHHMM(),
-		ISO8601:   now.Format(time.RFC3339),
+		Timestamp:              now.Unix(),
+		Time:                   now.Format("15:04:05.999999"),
+		Date:                   now.Format("2006-01-02"),
+		Timezone:               tzName,
+		Abbr:                   tz.TzInfos()[tzName].ShortStandard(),
+		Offset:                 tz.TzInfos()[tzName].StandardOffsetHHMM(),
+		ISO8601:                now.Format(time.RFC3339),
+		ServerReceivedMs:       received.UnixMilli(),
+		ServerSentMs:           sent.UnixMilli(),
+		ClockSource:            "host",
+		ClockCorrectionApplied: false,
+		DUT1:                   dut1Info,
 	}
 
 	// Return the response
@@ -445,7 +881,45 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
   "timezone": "UTC",
   "abbr": "GMT",
   "offset": "+00:00",
-  "iso8601": "2021-10-18T10:13:44+00:00"
+  "iso8601": "2021-10-18T10:13:44+00:00",
+  "dut1": {
+    "date": "2021-10-18",
+    "date_basis": "UTC",
+    "unit": "s",
+    "source": "IERS Bulletin A",
+    "stale": false,
+    "available": true,
+    "previous": { "date": "2021-10-17", "value": 0.0312, "dut1": 0, "type": "observed" },
+    "current":  { "date": "2021-10-18", "value": 0.0298, "dut1": 0, "type": "observed" },
+    "next":     { "date": "2021-10-19", "value": 0.0284, "dut1": 0, "type": "predicted" }
+  }
+}</pre>
+    </div>
+
+    <div class="endpoint">
+        <h3>Get DUT1 (UT1-UTC) for a Date and its Neighbours</h3>
+        <code>GET /v1/dut1?date={yyyy-MM-dd}&amp;source={auto|ntsc|iers}</code>
+        <p>Parameters:</p>
+        <ul>
+            <li><code>date</code> (optional): UTC calendar date in YYYY-MM-DD format. Defaults to the current UTC date.</li>
+            <li><code>source</code> (optional): <code>auto</code> (prefer fresh NTSC, then IERS), <code>ntsc</code>, or <code>iers</code>.</li>
+        </ul>
+        <p>Returns the published UT1-UTC value for the requested date together with the day before and the day after. Values that have not yet been observed are marked as <code>predicted</code>. The value is in seconds; <code>dut1</code> is the same value rounded to the 0.1 s step used by time-signal broadcasts.</p>
+        <p>Example Response:</p>
+        <pre>{
+  "date": "2026-10-18",
+  "date_basis": "UTC",
+  "unit": "s",
+  "source": "IERS Bulletin A",
+  "source_key": "iers",
+  "source_mode": "auto",
+  "source_url": "https://datacenter.iers.org/data/latestVersion/bulletinA.txt",
+  "updated_at": "2026-10-18T08:00:00Z",
+  "stale": false,
+  "available": true,
+  "previous": { "date": "2026-10-17", "mjd": 61330, "value": -0.03769, "dut1": 0, "type": "predicted" },
+  "current":  { "date": "2026-10-18", "mjd": 61331, "value": -0.03825, "dut1": 0, "type": "predicted" },
+  "next":     { "date": "2026-10-19", "mjd": 61332, "value": -0.03897, "dut1": 0, "type": "predicted" }
 }</pre>
     </div>
 
@@ -674,12 +1148,31 @@ func main() {
 	createTimeZoneList()
 	Logger.Printf("Loaded %d timezones", len(timezones))
 
+	// Start the DUT1 cache. The first refresh is attempted synchronously so
+	// that early requests can already return the current UT1-UTC value. If
+	// the upstream source is unreachable, the server still starts and the
+	// refresh loop retries in the background.
+	dut1 = newDUT1Service(Logger)
+	dut1.Start(context.Background())
+	if envBool("DUT1_NTSC_ENABLED", true) {
+		dut1NTSC = newNTSCDUT1Service(Logger)
+		dut1NTSC.Start(context.Background())
+	}
+
+	// Observe the upstream NTP source without touching the host clock. This
+	// gives the browser a way to distinguish "host follows UTC" from "host is in
+	// holdover after losing its NTP source".
+	ntpMonitor = newNTPMonitorFromEnv()
+	ntpMonitor.Start(context.Background())
+
 	// Create a custom mux with our notFoundHandler
 	mux := http.NewServeMux()
 
 	// Register handlers with CORS middleware
 	mux.HandleFunc("/", rootHandler)
 	mux.HandleFunc("/v1/time", corsMiddleware(timeV1Handler))
+	mux.HandleFunc("/v1/time/ntp", corsMiddleware(ntpTimeV1Handler))
+	mux.HandleFunc("/v1/dut1", corsMiddleware(dut1V1Handler))
 	mux.HandleFunc("/v1/timezones", corsMiddleware(timezonesV1Handler))
 	mux.HandleFunc("/v1/openapi.json", corsMiddleware(openAPIV1Handler))
 	mux.HandleFunc("/robots.txt", robotsTxtHandler)

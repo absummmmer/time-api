@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  time-api:
+    build: .
+    container_name: time-api
+    restart: unless-stopped
+    ports:
+      # Host port is configurable; default 8080.
+      - "${TIME_API_PORT:-8080}:8080"
+    environment:
+      - TZ=UTC
+      # Upstream EOP source. Supports a comma-separated fallback list.
+      - DUT1_SOURCE_URL=https://datacenter.iers.org/data/latestVersion/bulletinA.txt
+      # Refresh the cache every 6 hours; retry failed fetches after 5 minutes.
+      - DUT1_REFRESH_INTERVAL=6h
+      - DUT1_HTTP_TIMEOUT=30s
+      - DUT1_STALE_AFTER=12h
+      # Also cache the NTSC EOP product and allow source=auto/ntsc/iers.
+      - DUT1_NTSC_ENABLED=true
+      - DUT1_DEFAULT_SOURCE=auto
+      # Observe the upstream NTP source from inside the container. The monitor
+      # itself never changes the host/container clock; /v1/time/ntp may apply a
+      # bounded correction to the timestamps it serves.
+      - NTP_MONITOR_ENABLED=true
+      # Priority order, comma-separated. NTSC stays first; the rest are
+      # fallback/health sources when the primary path is unusable.
+      - NTP_MONITOR_SERVERS=ntp.ntsc.ac.cn,ntp.aliyun.com,pool.ntp.org,time.apple.com
+      - NTP_MONITOR_INTERVAL=5m
+      - NTP_MONITOR_TIMEOUT=3s
+      - NTP_MONITOR_HOLDOVER_AFTER=20m
+      - NTP_MONITOR_MAX_OFFSET_MS=10
+      - NTP_MONITOR_MAX_UNCERTAINTY_MS=20
+      # Apply host-time correction when the NTP sample is fresh and uncertainty
+      # is <= 20ms. `first` means only the first configured source, while
+      # synchronized and non-fallback, may correct; fallback sources are
+      # observation-only. Set to `off` for monitor-only operation.
+      - NTP_CORRECTION_MODE=first
+      - NTP_CORRECTION_MAX_UNCERTAINTY_MS=20
+      - NTP_CORRECTION_MAX_AGE=10m
+      - NTP_CORRECTION_DRIFT_MS_PER_HOUR=0

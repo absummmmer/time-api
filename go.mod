@@ -1,4 +1,4 @@
-module github.com/time-api
+module github.com/petstack/time-api
 
 go 1.21
 
