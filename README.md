@@ -2,7 +2,8 @@
 
 A small self-hosted REST API for UTC time, timezone data, published DUT1
 (UT1−UTC) values, and observe-only upstream NTP health. It is designed for the
-Time Station Simulator but can be used by any client that needs the same JSON
+[Time Station Simulator](https://github.com/absummmmer/time-station-simulator)
+but can be used by any client that needs the same JSON
 fields.
 
 The API does not set or discipline the host clock. It reports time and clock
