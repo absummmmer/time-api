@@ -20,8 +20,9 @@ and adds DUT1 provisioning and the upstream NTP monitor.
   browser four-timestamp synchronization
 - Observe-only upstream NTP monitor: reports reachability, offset, stratum,
   quality gates and holdover without changing the host clock
-- DUT1 endpoint backed by IERS Bulletin A and the NTSC EOP product, with
-  in-memory caching and observed/predicted value types
+- DUT1 endpoint backed by IERS Bulletin A and the NTSC EOP product, with an
+  IERS-first fallback, a persistent last-good cache, and observed/predicted
+  value types
 - OpenAPI document and timezone list
 - CORS for GET requests
 - JSON request logs with request IDs
@@ -192,8 +193,11 @@ GET /v1/dut1?date=2026-10-18&source=auto
 ```
 
 `date` is optional; the current UTC date is used when omitted. `source` accepts
-`auto` (default), `ntsc`, or `iers`. `auto` prefers a fresh NTSC EOP cache and
-falls back to IERS Bulletin A.
+`auto` (default), `ntsc`, or `iers`. `auto` prefers a fresh IERS Bulletin A cache
+and falls back to the NTSC EOP product only when IERS is stale or unavailable;
+an IERS refresh failure also warms the fallback in the background. The two
+sources are exposed side by side in the `alternate` object so a client can
+inspect the backup without another request.
 
 Values are in seconds. `dut1` is the same value rounded to the 0.1 s step used by
 time-signal broadcasts. `type` is `observed` or `predicted`. If no value exists
@@ -221,14 +225,32 @@ environment variables.
 | `DUT1_REFRESH_INTERVAL` | `6h` | Cache refresh interval; minimum 5 minutes. |
 | `DUT1_HTTP_TIMEOUT` | `20s` | HTTP timeout for one source; minimum 5 seconds. |
 | `DUT1_STALE_AFTER` | `2 × refresh` | Age after which cached data is reported as stale. |
-| `DUT1_NTSC_ENABLED` | `true` | Also cache the NTSC EOP product. |
-| `DUT1_NTSC_BASE_URL` | `http://www.ut1.ntsc.ac.cn` | NTSC EOP site base URL. |
+| `DUT1_CACHE_DIR` | — (disabled) | Directory for last-good snapshots; both sources survive restarts without a network fetch. Compose uses `/data/dut1`. |
+| `DUT1_NTSC_ENABLED` | `true` | Load the NTSC EOP backup from cache and start it on demand when IERS is stale/unavailable. |
+| `DUT1_NTSC_BASE_URL` | `http://www.ut1.ntsc.ac.cn` | NTSC EOP site base URL. The service uses the site's JSON file-list endpoint (`/ftpFile/findDataList`) and downloads only a new `NTSC_EOP_yyyyMMdd` file. |
+| `DUT1_NTSC_REFRESH_INTERVAL` | `24h` | NTSC metadata/refresh interval; minimum 1 hour. |
+| `DUT1_NTSC_RETRY_INTERVAL` | `1h` | Retry delay after a failed NTSC fallback refresh; minimum 5 minutes. |
+| `DUT1_NTSC_STALE_AFTER` | `2 × NTSC refresh` | Age after which the NTSC cache is reported as stale. |
 | `DUT1_DEFAULT_SOURCE` | `auto` | Default source: `auto`, `ntsc`, or `iers`. |
 
 The parser recognizes IERS Bulletin A and 16-column NTSC EOP files. NTSC is not
 a single static file: the service queries the site's data list, selects the
 newest `NTSC_EOP_yyyyMMdd` file, and downloads it. The parser uses the file's
 `Last date with real data` marker to distinguish observed rows from predictions.
+
+In `auto` mode NTSC is a real backup, not a second primary:
+
+- while IERS has fresh data, NTSC is loaded from its disk cache and **not
+  contacted**;
+- if IERS is stale or missing, the NTSC fallback is started on demand; an IERS
+  refresh failure also starts the fallback in the background before the last-good
+  IERS cache goes stale;
+- once running, the NTSC refresh only fetches the small file list and skips the
+  multi-megabyte EOP download when the latest file ID is unchanged;
+- with `DUT1_CACHE_DIR` set (the Compose file uses the `dut1-cache` volume),
+  both sources keep serving their last-good snapshot after a restart even when
+  both upstream networks are unreachable. Set the cache directory to a mounted
+  volume if you rebuild/recreate the container frequently.
 
 ### Upstream NTP monitor
 

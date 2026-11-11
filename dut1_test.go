@@ -6,6 +6,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -278,6 +280,118 @@ func TestDUT1ServiceRefresh(t *testing.T) {
 	}
 	if !info.Available {
 		t.Fatal("refreshed service has no current DUT1 value")
+	}
+}
+
+func TestDUT1CacheRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	day := now.Format("2006-01-02")
+	src := &dut1Service{
+		sourceKey:  "ntsc",
+		source:     "NTSC EOP",
+		sourceURL:  "http://example.invalid/eop",
+		updatedAt:  now,
+		refresh:    24 * time.Hour,
+		staleAfter: 48 * time.Hour,
+		cacheDir:   dir,
+		logger:     NewJSONLogger(io.Discard),
+	}
+	src.mu.Lock()
+	src.points = map[string]DUT1Point{day: {Date: day, Value: -0.0568, DUT1: -0.1, Type: "predicted"}}
+	src.mu.Unlock()
+	src.saveCache()
+
+	restored := &dut1Service{
+		sourceKey:  "ntsc",
+		refresh:    24 * time.Hour,
+		staleAfter: 48 * time.Hour,
+		cacheDir:   dir,
+		logger:     NewJSONLogger(io.Discard),
+	}
+	restored.LoadCache()
+	info := restored.Info(now)
+	if !info.Available || info.SourceKey != "ntsc" {
+		t.Fatalf("unexpected restored info: %+v", info)
+	}
+	if info.Current == nil || math.Abs(info.Current.Value-(-0.0568)) > 1e-12 {
+		t.Fatalf("unexpected restored current: %+v", info.Current)
+	}
+	if !restored.cacheIsFresh(now) {
+		t.Fatal("restored cache should be fresh for today's date")
+	}
+}
+
+func TestDUT1AutoPrefersFreshIERS(t *testing.T) {
+	oldIERS, oldNTSC := dut1, dut1NTSC
+	defer func() { dut1, dut1NTSC = oldIERS, oldNTSC }()
+
+	now := time.Now().UTC()
+	day := now.Format("2006-01-02")
+	makeService := func(key string, updated time.Time) *dut1Service {
+		return &dut1Service{
+			sourceKey:  key,
+			source:     strings.ToUpper(key),
+			updatedAt:  updated,
+			staleAfter: time.Hour,
+			logger:     NewJSONLogger(io.Discard),
+			points:     map[string]DUT1Point{day: {Date: day, Value: -0.1, Type: "predicted"}},
+		}
+	}
+
+	dut1 = makeService("iers", now)
+	dut1NTSC = makeService("ntsc", now)
+	if got := dut1InfoFor(now, "auto"); got.SourceKey != "iers" {
+		t.Fatalf("auto source = %q, want iers when both are fresh", got.SourceKey)
+	}
+
+	// A stale IERS cache must yield to a fresh NTSC fallback.
+	dut1 = makeService("iers", now.Add(-2*time.Hour))
+	dut1NTSC = makeService("ntsc", now)
+	if got := dut1InfoFor(now, "auto"); got.SourceKey != "ntsc" {
+		t.Fatalf("auto source = %q, want ntsc when IERS is stale", got.SourceKey)
+	}
+
+	// A missing IERS cache must also fall back to NTSC.
+	dut1 = &dut1Service{sourceKey: "iers", staleAfter: time.Hour, logger: NewJSONLogger(io.Discard)}
+	dut1NTSC = makeService("ntsc", now)
+	if got := dut1InfoFor(now, "auto"); got.SourceKey != "ntsc" {
+		t.Fatalf("auto source = %q, want ntsc when IERS has no data", got.SourceKey)
+	}
+}
+
+func TestNTSCSkipsUnchangedFileDownload(t *testing.T) {
+	const ntsc = `#    Last date with real data:  2026-11-02
+2026 11 2 61346 0.136114 0.317750 -0.0556760 0.0010051 0.000345 0.000000 0.999 0.999 0.999 0.999 0.999 0.999
+2026 11 3 61347 0.134247 0.317549 -0.0568139 0.0011433 0.000342 0.000000 0.999 0.999 0.999 0.999 0.999 0.999
+`
+	var downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ftpFile/findDataList":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"code":0,"data":[{"id":42,"fileName":"NTSC_EOP_20261103","createTime":"2026-11-03 15:30:00"}]}`)
+		case "/ftpFile/download":
+			downloads.Add(1)
+			_, _ = io.WriteString(w, ntsc)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	svc := newNTSCDUT1Service(NewJSONLogger(io.Discard))
+	svc.ntscBaseURL = server.URL
+	svc.client = server.Client()
+	svc.cacheDir = ""
+	if err := svc.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("first refresh failed: %v", err)
+	}
+	if err := svc.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("second refresh failed: %v", err)
+	}
+	if got := downloads.Load(); got != 1 {
+		t.Fatalf("downloaded %d times, want 1 (second run must use unchanged-file shortcut)", got)
 	}
 }
 

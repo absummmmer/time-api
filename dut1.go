@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +20,23 @@ const (
 	defaultDUT1SourceURL = "https://datacenter.iers.org/data/latestVersion/bulletinA.txt"
 	defaultDUT1Refresh   = 6 * time.Hour
 	defaultDUT1Timeout   = 20 * time.Second
+	defaultNTSCRefresh   = 24 * time.Hour
+	defaultNTSCRetry     = time.Hour
 	defaultNTSCBaseURL   = "http://www.ut1.ntsc.ac.cn"
 )
+
+// dut1CacheSnapshot is the on-disk form of one provider's last-good data. It
+// lets the API keep serving DUT1 after a restart while both upstream networks
+// are unreachable, without downloading the source again on every boot.
+type dut1CacheSnapshot struct {
+	Source         string               `json:"source"`
+	SourceKey      string               `json:"source_key"`
+	SourceURL      string               `json:"source_url"`
+	UpdatedAt      time.Time            `json:"updated_at"`
+	Points         map[string]DUT1Point `json:"points"`
+	NTSCLatestID   int                  `json:"ntsc_latest_id,omitempty"`
+	NTSCLatestName string               `json:"ntsc_latest_name,omitempty"`
+}
 
 // DUT1Point is one daily UT1-UTC value published by an EOP source.
 type DUT1Point struct {
@@ -81,10 +97,16 @@ type dut1Service struct {
 	ntscBaseURL string
 	urls        []string
 	refresh     time.Duration
+	retry       time.Duration
 	staleAfter  time.Duration
 	timeout     time.Duration
 	client      *http.Client
 	logger      *JSONLogger
+	cacheDir    string
+
+	startOnce      sync.Once
+	ntscLatestID   int
+	ntscLatestName string
 }
 
 func newDUT1Service(logger *JSONLogger) *dut1Service {
@@ -124,12 +146,14 @@ func newDUT1Service(logger *JSONLogger) *dut1Service {
 		ntscBaseURL: strings.TrimRight(ntscBaseURL, "/"),
 		urls:        urls,
 		refresh:     refresh,
+		retry:       5 * time.Minute,
 		staleAfter:  staleAfter,
 		timeout:     timeout,
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		logger: logger,
+		logger:   logger,
+		cacheDir: strings.TrimSpace(os.Getenv("DUT1_CACHE_DIR")),
 	}
 }
 
@@ -138,6 +162,18 @@ func newNTSCDUT1Service(logger *JSONLogger) *dut1Service {
 	service.mode = "ntsc"
 	service.sourceKey = "ntsc"
 	service.urls = nil
+	service.refresh = envDuration("DUT1_NTSC_REFRESH_INTERVAL", defaultNTSCRefresh)
+	if service.refresh < time.Hour {
+		service.refresh = time.Hour
+	}
+	service.retry = envDuration("DUT1_NTSC_RETRY_INTERVAL", defaultNTSCRetry)
+	if service.retry < 5*time.Minute {
+		service.retry = 5 * time.Minute
+	}
+	service.staleAfter = envDuration("DUT1_NTSC_STALE_AFTER", 2*service.refresh)
+	if service.staleAfter < service.refresh {
+		service.staleAfter = 2 * service.refresh
+	}
 	return service
 }
 
@@ -155,17 +191,45 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 
 // Start performs an initial, best-effort refresh and then keeps the cache up
 // to date in the background. A failed initial refresh does not stop the
-// server; the request handlers simply report that DUT1 is unavailable.
+// server; the request handlers report unavailable/stale data and the refresh
+// loop retries later. If a usable disk cache exists, the initial network fetch
+// is deferred until the cache expires.
 func (s *dut1Service) Start(ctx context.Context) {
+	s.startOnce.Do(func() { s.start(ctx) })
+}
+
+// EnsureStarted starts a service asynchronously exactly once. It is used for
+// the NTSC fallback so that, while the primary IERS source is healthy, NTSC is
+// loaded from disk but never contacted.
+func (s *dut1Service) EnsureStarted() {
+	s.startOnce.Do(func() {
+		go s.start(context.Background())
+	})
+}
+
+func (s *dut1Service) start(ctx context.Context) {
+	s.LoadCache()
 	s.logger.Println("Initializing DUT1 service...")
-	initCtx, cancel := context.WithTimeout(ctx, s.timeout)
-	err := s.refreshOnce(initCtx)
-	cancel()
 
 	delay := s.refresh
-	if err != nil {
-		s.logger.Error("", "Initial DUT1 refresh failed", map[string]interface{}{"error": err.Error()})
-		delay = 2 * time.Minute
+	if s.cacheIsFresh(time.Now()) {
+		age := s.cacheAge()
+		delay = s.refresh - age
+		if delay < time.Minute {
+			delay = time.Minute
+		}
+		s.logger.Info("", "DUT1 cache is fresh; deferring upstream refresh", map[string]interface{}{
+			"source_key": s.sourceKey,
+			"cache_age":  age.String(),
+		})
+	} else {
+		initCtx, cancel := context.WithTimeout(ctx, s.timeout)
+		err := s.refreshOnce(initCtx)
+		cancel()
+		if err != nil {
+			s.logger.Error("", "Initial DUT1 refresh failed", map[string]interface{}{"error": err.Error()})
+			delay = s.retry
+		}
 	}
 	go s.run(ctx, delay)
 }
@@ -183,7 +247,7 @@ func (s *dut1Service) run(ctx context.Context, delay time.Duration) {
 		cancel()
 		if err != nil {
 			s.logger.Error("", "DUT1 refresh failed", map[string]interface{}{"error": err.Error()})
-			delay = 5 * time.Minute
+			delay = s.retry
 			continue
 		}
 		delay = s.refresh
@@ -234,15 +298,193 @@ func (s *dut1Service) storePoints(points map[string]DUT1Point, source, sourceURL
 	s.updatedAt = time.Now().UTC()
 	s.lastErr = nil
 	s.mu.Unlock()
+	s.saveCache()
+}
+
+// hasUsable reports whether at least a cached value exists for the requested
+// date, even if that cache is stale.
+func (s *dut1Service) hasUsable(at time.Time) bool {
+	info := s.Info(at)
+	return info.Available
+}
+
+// hasFresh reports whether a non-stale value exists for the requested date.
+func (s *dut1Service) hasFresh(at time.Time) bool {
+	info := s.Info(at)
+	return info.Available && !info.Stale
+}
+
+// refreshFailed reports whether the most recent upstream attempt failed. The
+// last-good data can still be served, but in auto mode a failed primary refresh
+// is a signal to warm up the NTSC fallback before the primary cache goes stale.
+func (s *dut1Service) refreshFailed() bool {
+	s.mu.RLock()
+	failed := s.lastErr != nil
+	s.mu.RUnlock()
+	return failed
+}
+
+func (s *dut1Service) cachePath() string {
+	if s.cacheDir == "" {
+		return ""
+	}
+	key := s.sourceKey
+	if key == "" {
+		key = "dut1"
+	}
+	return filepath.Join(s.cacheDir, "dut1-"+key+".json")
+}
+
+func (s *dut1Service) cacheAge() time.Duration {
+	s.mu.RLock()
+	updatedAt := s.updatedAt
+	s.mu.RUnlock()
+	if updatedAt.IsZero() {
+		return 0
+	}
+	return time.Since(updatedAt)
+}
+
+// cacheIsFresh accepts a disk/network cache only when it is younger than the
+// refresh interval and still covers today's UTC date. That prevents a restart
+// from triggering an unnecessary upstream request while still refreshing when
+// the cached table has rolled past its last available day.
+func (s *dut1Service) cacheIsFresh(now time.Time) bool {
+	s.mu.RLock()
+	updatedAt := s.updatedAt
+	points := s.points
+	s.mu.RUnlock()
+	if updatedAt.IsZero() || len(points) == 0 || now.Sub(updatedAt) >= s.refresh {
+		return false
+	}
+	_, hasToday := points[now.UTC().Format("2006-01-02")]
+	return hasToday
+}
+
+// LoadCache restores the last-good snapshot written by saveCache. It is safe
+// to call more than once; an already-populated in-memory cache is kept.
+func (s *dut1Service) LoadCache() {
+	path := s.cachePath()
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			s.logger.Error("", "DUT1 cache read failed", map[string]interface{}{"path": path, "error": err.Error()})
+		}
+		return
+	}
+	var snapshot dut1CacheSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		s.logger.Error("", "DUT1 cache decode failed", map[string]interface{}{"path": path, "error": err.Error()})
+		return
+	}
+	if snapshot.SourceKey != "" && s.sourceKey != "" && snapshot.SourceKey != s.sourceKey {
+		return
+	}
+	if len(snapshot.Points) == 0 {
+		return
+	}
+	source := snapshot.Source
+	if source == "" {
+		if s.sourceKey == "ntsc" {
+			source = "NTSC EOP"
+		} else {
+			source = "IERS Bulletin A"
+		}
+	}
+	s.mu.Lock()
+	if len(s.points) == 0 {
+		s.points = snapshot.Points
+		s.source = source
+		s.sourceURL = snapshot.SourceURL
+		s.updatedAt = snapshot.UpdatedAt
+		s.ntscLatestID = snapshot.NTSCLatestID
+		s.ntscLatestName = snapshot.NTSCLatestName
+	}
+	s.mu.Unlock()
+	s.logger.Info("", "DUT1 cache restored", map[string]interface{}{
+		"path":       path,
+		"source_key": s.sourceKey,
+		"days":       len(snapshot.Points),
+		"updated_at": snapshot.UpdatedAt.Format(time.RFC3339),
+	})
+}
+
+// saveCache writes the last-good snapshot atomically so a Docker restart can
+// serve DUT1 immediately even while both upstream providers are unreachable.
+func (s *dut1Service) saveCache() {
+	path := s.cachePath()
+	if path == "" {
+		return
+	}
+	s.mu.RLock()
+	snapshot := dut1CacheSnapshot{
+		Source:         s.source,
+		SourceKey:      s.sourceKey,
+		SourceURL:      s.sourceURL,
+		UpdatedAt:      s.updatedAt,
+		Points:         s.points,
+		NTSCLatestID:   s.ntscLatestID,
+		NTSCLatestName: s.ntscLatestName,
+	}
+	s.mu.RUnlock()
+	if len(snapshot.Points) == 0 {
+		return
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		s.logger.Error("", "DUT1 cache encode failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
+		s.logger.Error("", "DUT1 cache directory create failed", map[string]interface{}{"path": s.cacheDir, "error": err.Error()})
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		s.logger.Error("", "DUT1 cache write failed", map[string]interface{}{"path": tmp, "error": err.Error()})
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		s.logger.Error("", "DUT1 cache rename failed", map[string]interface{}{"path": path, "error": err.Error()})
+	}
 }
 
 func (s *dut1Service) refreshNTSC(ctx context.Context) error {
-	body, downloadURL, err := s.fetchNTSCFile(ctx)
+	latest, err := s.fetchNTSCList(ctx)
 	if err != nil {
 		s.mu.Lock()
 		s.lastErr = err
 		s.mu.Unlock()
 		return err
+	}
+
+	// The NTSC site publishes one large daily EOP file. A metadata-only list
+	// request is enough to know whether a new file exists; skip the multi-MB
+	// download when the file ID is unchanged. This keeps the fallback source
+	// low-traffic even when it is queried regularly.
+	downloadURL := fmt.Sprintf("%s/ftpFile/download?fileId=%d", s.ntscBaseURL, latest.ID)
+	s.mu.RLock()
+	cachedID := s.ntscLatestID
+	hasCachedPoints := len(s.points) > 0
+	s.mu.RUnlock()
+	if latest.ID > 0 && latest.ID == cachedID && hasCachedPoints {
+		s.logger.Info("", "NTSC EOP file unchanged; download skipped", map[string]interface{}{
+			"file": latest.FileName,
+			"id":   latest.ID,
+		})
+		return nil
+	}
+
+	body, err := s.fetchSource(ctx, downloadURL)
+	if err != nil {
+		wrapped := fmt.Errorf("download %s: %w", latest.FileName, err)
+		s.mu.Lock()
+		s.lastErr = wrapped
+		s.mu.Unlock()
+		return wrapped
 	}
 	points, err := parseDUT1Text(string(body))
 	if err != nil {
@@ -252,9 +494,14 @@ func (s *dut1Service) refreshNTSC(ctx context.Context) error {
 		s.mu.Unlock()
 		return wrapped
 	}
+	s.mu.Lock()
+	s.ntscLatestID = latest.ID
+	s.ntscLatestName = latest.FileName
+	s.mu.Unlock()
 	s.storePoints(points, "NTSC EOP", downloadURL)
 	s.logger.Info("", "NTSC DUT1 data loaded", map[string]interface{}{
 		"source": downloadURL,
+		"file":   latest.FileName,
 		"days":   len(points),
 	})
 	return nil
@@ -272,12 +519,12 @@ type ntscDataListResponse struct {
 	Data []ntscDataListEntry `json:"data"`
 }
 
-func (s *dut1Service) fetchNTSCFile(ctx context.Context) ([]byte, string, error) {
+func (s *dut1Service) fetchNTSCList(ctx context.Context) (*ntscDataListEntry, error) {
 	listURL := s.ntscBaseURL + "/ftpFile/findDataList"
 	payload := `{"page":1,"pageSize":10,"query":{"type":1}}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, listURL, strings.NewReader(payload))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "time-api/1.1 (DUT1 provider)")
 	req.Header.Set("Content-Type", "application/json")
@@ -285,18 +532,18 @@ func (s *dut1Service) fetchNTSCFile(ctx context.Context) ([]byte, string, error)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("NTSC data list request: %w", err)
+		return nil, fmt.Errorf("NTSC data list request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("NTSC data list HTTP %s", resp.Status)
+		return nil, fmt.Errorf("NTSC data list HTTP %s", resp.Status)
 	}
 	var list ntscDataListResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&list); err != nil {
-		return nil, "", fmt.Errorf("decode NTSC data list: %w", err)
+		return nil, fmt.Errorf("decode NTSC data list: %w", err)
 	}
 	if list.Code != 0 {
-		return nil, "", fmt.Errorf("NTSC data list returned code %d", list.Code)
+		return nil, fmt.Errorf("NTSC data list returned code %d", list.Code)
 	}
 
 	var latest *ntscDataListEntry
@@ -318,15 +565,9 @@ func (s *dut1Service) fetchNTSCFile(ctx context.Context) ([]byte, string, error)
 		}
 	}
 	if latest == nil {
-		return nil, "", fmt.Errorf("no NTSC_EOP_yyyyMMdd file found in data list")
+		return nil, fmt.Errorf("no NTSC_EOP_yyyyMMdd file found in data list")
 	}
-
-	downloadURL := fmt.Sprintf("%s/ftpFile/download?fileId=%d", s.ntscBaseURL, latest.ID)
-	body, err := s.fetchSource(ctx, downloadURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("download %s: %w", latest.FileName, err)
-	}
-	return body, downloadURL, nil
+	return latest, nil
 }
 
 func (s *dut1Service) fetchSource(ctx context.Context, url string) ([]byte, error) {
@@ -479,17 +720,48 @@ func dut1InfoFor(at time.Time, mode string) DUT1Info {
 	switch normalized {
 	case "ntsc":
 		service = dut1NTSC
+		if service != nil {
+			service.EnsureStarted()
+		}
 	case "iers":
 		service = dut1
 	default:
+		var iersInfo, ntscInfo *DUT1Info
+		if dut1 != nil {
+			info := dut1.Info(at)
+			iersInfo = &info
+		}
 		if dut1NTSC != nil {
-			candidate := dut1NTSC.Info(at)
-			if candidate.Available && !candidate.Stale {
+			info := dut1NTSC.Info(at)
+			ntscInfo = &info
+		}
+		iersFresh := iersInfo != nil && iersInfo.Available && !iersInfo.Stale
+		ntscFresh := ntscInfo != nil && ntscInfo.Available && !ntscInfo.Stale
+
+		// Prefer a fresh IERS value. NTSC is a backup: it is selected only when
+		// IERS is stale/missing, or when the IERS cache is not usable at all.
+		switch {
+		case iersFresh:
+			service = dut1
+		case ntscFresh:
+			service = dut1NTSC
+		case iersInfo != nil && iersInfo.Available:
+			service = dut1
+		case ntscInfo != nil && ntscInfo.Available:
+			service = dut1NTSC
+		default:
+			service = dut1
+			if service == nil {
 				service = dut1NTSC
 			}
 		}
-		if service == nil {
-			service = dut1
+
+		// Only start the NTSC fallback network path when IERS has no fresh value,
+		// or when the primary refresh has failed (warm up the backup before the
+		// last-good IERS cache crosses its stale threshold).
+		primaryRefreshFailed := dut1 != nil && dut1.refreshFailed()
+		if dut1NTSC != nil && !ntscFresh && (!iersFresh || primaryRefreshFailed) {
+			dut1NTSC.EnsureStarted()
 		}
 	}
 	if service == nil {
