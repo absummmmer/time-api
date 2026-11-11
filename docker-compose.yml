@@ -21,8 +21,13 @@ services:
       - DUT1_STALE_AFTER=12h
       # Persistent last-good snapshot used when upstreams are unreachable.
       - DUT1_CACHE_DIR=/data/dut1
-      # NTSC is a backup: it is contacted only when IERS is stale/missing.
-      # Once started, check the small file list daily and download only a new file.
+      # Prefer the official IERS host; if it is unreachable, use NTSC's mirror
+      # of the same IERS Bulletin A files. Resolve the mirror at most daily.
+      - DUT1_IERS_MIRROR_ENABLED=true
+      - DUT1_IERS_MIRROR_REFRESH_INTERVAL=24h
+      - DUT1_IERS_MIRROR_RETRY_INTERVAL=1h
+      # Independent NTSC EOP peer source (not an IERS backup). Refreshed daily;
+      # the large EOP file is only downloaded when its file ID changes.
       - DUT1_NTSC_ENABLED=true
       - DUT1_NTSC_REFRESH_INTERVAL=24h
       - DUT1_NTSC_RETRY_INTERVAL=1h

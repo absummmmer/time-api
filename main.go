@@ -274,7 +274,7 @@ const openAPISpec = `{
     "/dut1": {
       "get": {
         "summary": "Get DUT1 (UT1-UTC) for a UTC date and its neighbours",
-        "description": "Returns the published UT1-UTC values for the requested UTC date, the day before and the day after. Values that have not yet been observed are marked as predicted. The source can be auto (prefer fresh IERS, then NTSC fallback), ntsc, or iers.",
+        "description": "Returns the published UT1-UTC values for the requested UTC date, the day before and the day after. Values that have not yet been observed are marked as predicted. The source can be auto (IERS, with the NTSC-hosted IERS Bulletin A mirror as provider fallback; NTSC EOP is a separate peer source), ntsc, or iers.",
         "parameters": [
           {
             "name": "date",
@@ -902,7 +902,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         <p>Parameters:</p>
         <ul>
             <li><code>date</code> (optional): UTC calendar date in YYYY-MM-DD format. Defaults to the current UTC date.</li>
-            <li><code>source</code> (optional): <code>auto</code> (prefer fresh IERS, then NTSC fallback), <code>ntsc</code>, or <code>iers</code>.</li>
+            <li><code>source</code> (optional): <code>auto</code> (IERS, with the NTSC-hosted IERS Bulletin A mirror as provider fallback; NTSC EOP is a separate peer source), <code>ntsc</code>, or <code>iers</code>.</li>
         </ul>
         <p>Returns the published UT1-UTC value for the requested date together with the day before and the day after. Values that have not yet been observed are marked as <code>predicted</code>. The value is in seconds; <code>dut1</code> is the same value rounded to the 0.1 s step used by time-signal broadcasts.</p>
         <p>Example Response:</p>
@@ -1156,13 +1156,11 @@ func main() {
 	dut1.Start(context.Background())
 	if envBool("DUT1_NTSC_ENABLED", true) {
 		dut1NTSC = newNTSCDUT1Service(Logger)
-		// Restore the fallback cache without contacting NTSC. The network path is
-		// started below only when IERS is unavailable, or on demand later.
+		// Load the peer EOP cache synchronously, then refresh it in the
+		// background. This keeps startup independent of the NTSC network while
+		// still exposing the independent NTSC source once it is ready.
 		dut1NTSC.LoadCache()
-		now := time.Now()
-		if !dut1.hasFresh(now) && !dut1NTSC.hasFresh(now) {
-			dut1NTSC.EnsureStarted()
-		}
+		go dut1NTSC.Start(context.Background())
 	}
 
 	// Observe the upstream NTP source without touching the host clock. This

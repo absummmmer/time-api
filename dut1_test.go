@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -322,7 +323,7 @@ func TestDUT1CacheRoundTrip(t *testing.T) {
 	}
 }
 
-func TestDUT1AutoPrefersFreshIERS(t *testing.T) {
+func TestDUT1AutoUsesIERSOnly(t *testing.T) {
 	oldIERS, oldNTSC := dut1, dut1NTSC
 	defer func() { dut1, dut1NTSC = oldIERS, oldNTSC }()
 
@@ -345,18 +346,85 @@ func TestDUT1AutoPrefersFreshIERS(t *testing.T) {
 		t.Fatalf("auto source = %q, want iers when both are fresh", got.SourceKey)
 	}
 
-	// A stale IERS cache must yield to a fresh NTSC fallback.
+	// NTSC EOP is a peer source, not an automatic backup. auto must stay on
+	// IERS even when the IERS entry is stale and NTSC is fresher.
 	dut1 = makeService("iers", now.Add(-2*time.Hour))
 	dut1NTSC = makeService("ntsc", now)
-	if got := dut1InfoFor(now, "auto"); got.SourceKey != "ntsc" {
-		t.Fatalf("auto source = %q, want ntsc when IERS is stale", got.SourceKey)
+	if got := dut1InfoFor(now, "auto"); got.SourceKey != "iers" {
+		t.Fatalf("auto source = %q, want iers (peer NTSC must not be substituted)", got.SourceKey)
 	}
 
-	// A missing IERS cache must also fall back to NTSC.
+	// Even with no IERS values, auto still reports the IERS source (unavailable)
+	// rather than silently switching the primary source to NTSC EOP.
 	dut1 = &dut1Service{sourceKey: "iers", staleAfter: time.Hour, logger: NewJSONLogger(io.Discard)}
-	dut1NTSC = makeService("ntsc", now)
-	if got := dut1InfoFor(now, "auto"); got.SourceKey != "ntsc" {
-		t.Fatalf("auto source = %q, want ntsc when IERS has no data", got.SourceKey)
+	if got := dut1InfoFor(now, "auto"); got.SourceKey != "iers" || got.Available {
+		t.Fatalf("auto with empty IERS = %+v, want iers/unavailable", got)
+	}
+}
+
+func TestIERSMirrorFallback(t *testing.T) {
+	var listRequests, volumeRequests, fileRequests atomic.Int32
+	yearLabel := fmt.Sprintf("%02d-volume-xxvi", time.Now().UTC().Year()%100)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/primary":
+			http.Error(w, "official IERS host unavailable", http.StatusBadGateway)
+		case r.URL.Path == "/page/dataInternetList":
+			listRequests.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, `<ul><li><div class="title"><a href="/page/erpFile?q=product-token" target="_blank">Bulletin_A</a></div></li></ul>`)
+		case r.URL.Path == "/page/erpFile":
+			volumeRequests.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			if r.URL.Query().Get("q") == "product-token" {
+				_, _ = io.WriteString(w, `<ul><li><div class="title"><a href="/page/erpFile?q=volume-token&title=A">`+yearLabel+`/</a></div></li></ul>`)
+				return
+			}
+			_, _ = io.WriteString(w, `<ul>
+<li><a href="`+server.URL+`/IERS/bulletina/26-volume-xxvi/bulletina-xxvi-001.txt">old</a></li>
+<li><a href="`+server.URL+`/IERS/bulletina/26-volume-xxvi/bulletina-xxvi-002.txt">new</a></li>
+</ul>`)
+		case r.URL.Path == "/IERS/bulletina/26-volume-xxvi/bulletina-xxvi-002.txt":
+			fileRequests.Add(1)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, bulletinSample)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	svc := &dut1Service{
+		mode:              "url",
+		sourceKey:         "iers",
+		urls:              []string{server.URL + "/primary"},
+		ntscBaseURL:       server.URL,
+		iersMirrorEnabled: true,
+		iersMirrorRefresh: 24 * time.Hour,
+		iersMirrorRetry:   time.Hour,
+		timeout:           5 * time.Second,
+		staleAfter:        2 * time.Hour,
+		client:            server.Client(),
+		logger:            NewJSONLogger(io.Discard),
+	}
+	if err := svc.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("refreshOnce with mirror fallback failed: %v", err)
+	}
+	info := svc.Info(time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC))
+	if !info.Available || info.SourceKey != "iers" || !strings.Contains(info.Source, "NTSC mirror") {
+		t.Fatalf("unexpected IERS mirror info: %+v", info)
+	}
+	if listRequests.Load() != 1 || volumeRequests.Load() != 2 || fileRequests.Load() != 1 {
+		t.Fatalf("unexpected mirror requests: list=%d volume=%d file=%d", listRequests.Load(), volumeRequests.Load(), fileRequests.Load())
+	}
+
+	// A second refresh within the mirror interval must not re-list the site.
+	if err := svc.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("second refresh failed: %v", err)
+	}
+	if listRequests.Load() != 1 || fileRequests.Load() != 1 {
+		t.Fatalf("mirror was contacted again inside refresh interval: list=%d file=%d", listRequests.Load(), fileRequests.Load())
 	}
 }
 

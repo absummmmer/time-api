@@ -8,8 +8,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,12 +19,14 @@ import (
 )
 
 const (
-	defaultDUT1SourceURL = "https://datacenter.iers.org/data/latestVersion/bulletinA.txt"
-	defaultDUT1Refresh   = 6 * time.Hour
-	defaultDUT1Timeout   = 20 * time.Second
-	defaultNTSCRefresh   = 24 * time.Hour
-	defaultNTSCRetry     = time.Hour
-	defaultNTSCBaseURL   = "http://www.ut1.ntsc.ac.cn"
+	defaultDUT1SourceURL     = "https://datacenter.iers.org/data/latestVersion/bulletinA.txt"
+	defaultDUT1Refresh       = 6 * time.Hour
+	defaultDUT1Timeout       = 20 * time.Second
+	defaultNTSCRefresh       = 24 * time.Hour
+	defaultNTSCRetry         = time.Hour
+	defaultIERSMirrorRefresh = 24 * time.Hour
+	defaultIERSMirrorRetry   = time.Hour
+	defaultNTSCBaseURL       = "http://www.ut1.ntsc.ac.cn"
 )
 
 // dut1CacheSnapshot is the on-disk form of one provider's last-good data. It
@@ -36,6 +40,9 @@ type dut1CacheSnapshot struct {
 	Points         map[string]DUT1Point `json:"points"`
 	NTSCLatestID   int                  `json:"ntsc_latest_id,omitempty"`
 	NTSCLatestName string               `json:"ntsc_latest_name,omitempty"`
+	IERSMirrorURL  string               `json:"iers_mirror_url,omitempty"`
+	IERSMirrorName string               `json:"iers_mirror_name,omitempty"`
+	IERSMirrorAt   time.Time            `json:"iers_mirror_at,omitempty"`
 }
 
 // DUT1Point is one daily UT1-UTC value published by an EOP source.
@@ -107,6 +114,14 @@ type dut1Service struct {
 	startOnce      sync.Once
 	ntscLatestID   int
 	ntscLatestName string
+
+	iersMirrorEnabled   bool
+	iersMirrorRefresh   time.Duration
+	iersMirrorRetry     time.Duration
+	iersMirrorURL       string
+	iersMirrorName      string
+	iersMirrorAt        time.Time
+	iersMirrorAttemptAt time.Time
 }
 
 func newDUT1Service(logger *JSONLogger) *dut1Service {
@@ -139,6 +154,14 @@ func newDUT1Service(logger *JSONLogger) *dut1Service {
 	if ntscBaseURL == "" {
 		ntscBaseURL = defaultNTSCBaseURL
 	}
+	mirrorRefresh := envDuration("DUT1_IERS_MIRROR_REFRESH_INTERVAL", defaultIERSMirrorRefresh)
+	if mirrorRefresh < time.Hour {
+		mirrorRefresh = time.Hour
+	}
+	mirrorRetry := envDuration("DUT1_IERS_MIRROR_RETRY_INTERVAL", defaultIERSMirrorRetry)
+	if mirrorRetry < 5*time.Minute {
+		mirrorRetry = 5 * time.Minute
+	}
 
 	return &dut1Service{
 		mode:        "url",
@@ -152,8 +175,11 @@ func newDUT1Service(logger *JSONLogger) *dut1Service {
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		logger:   logger,
-		cacheDir: strings.TrimSpace(os.Getenv("DUT1_CACHE_DIR")),
+		logger:            logger,
+		cacheDir:          strings.TrimSpace(os.Getenv("DUT1_CACHE_DIR")),
+		iersMirrorEnabled: envBool("DUT1_IERS_MIRROR_ENABLED", true),
+		iersMirrorRefresh: mirrorRefresh,
+		iersMirrorRetry:   mirrorRetry,
 	}
 }
 
@@ -283,6 +309,17 @@ func (s *dut1Service) refreshOnce(ctx context.Context) error {
 		return nil
 	}
 
+	// The IERS official host can be unreachable from some networks. NTSC keeps
+	// a mirror of the same IERS Bulletin A files; only use it after every
+	// configured IERS URL failed, so the primary path stays authoritative.
+	if s.iersMirrorEnabled {
+		if err := s.refreshIERSMirror(ctx); err == nil {
+			return nil
+		} else {
+			failures = append(failures, "NTSC IERS mirror: "+err.Error())
+		}
+	}
+
 	err := fmt.Errorf("all DUT1 sources failed: %s", strings.Join(failures, "; "))
 	s.mu.Lock()
 	s.lastErr = err
@@ -299,29 +336,6 @@ func (s *dut1Service) storePoints(points map[string]DUT1Point, source, sourceURL
 	s.lastErr = nil
 	s.mu.Unlock()
 	s.saveCache()
-}
-
-// hasUsable reports whether at least a cached value exists for the requested
-// date, even if that cache is stale.
-func (s *dut1Service) hasUsable(at time.Time) bool {
-	info := s.Info(at)
-	return info.Available
-}
-
-// hasFresh reports whether a non-stale value exists for the requested date.
-func (s *dut1Service) hasFresh(at time.Time) bool {
-	info := s.Info(at)
-	return info.Available && !info.Stale
-}
-
-// refreshFailed reports whether the most recent upstream attempt failed. The
-// last-good data can still be served, but in auto mode a failed primary refresh
-// is a signal to warm up the NTSC fallback before the primary cache goes stale.
-func (s *dut1Service) refreshFailed() bool {
-	s.mu.RLock()
-	failed := s.lastErr != nil
-	s.mu.RUnlock()
-	return failed
 }
 
 func (s *dut1Service) cachePath() string {
@@ -402,6 +416,9 @@ func (s *dut1Service) LoadCache() {
 		s.updatedAt = snapshot.UpdatedAt
 		s.ntscLatestID = snapshot.NTSCLatestID
 		s.ntscLatestName = snapshot.NTSCLatestName
+		s.iersMirrorURL = snapshot.IERSMirrorURL
+		s.iersMirrorName = snapshot.IERSMirrorName
+		s.iersMirrorAt = snapshot.IERSMirrorAt
 	}
 	s.mu.Unlock()
 	s.logger.Info("", "DUT1 cache restored", map[string]interface{}{
@@ -428,6 +445,9 @@ func (s *dut1Service) saveCache() {
 		Points:         s.points,
 		NTSCLatestID:   s.ntscLatestID,
 		NTSCLatestName: s.ntscLatestName,
+		IERSMirrorURL:  s.iersMirrorURL,
+		IERSMirrorName: s.iersMirrorName,
+		IERSMirrorAt:   s.iersMirrorAt,
 	}
 	s.mu.RUnlock()
 	if len(snapshot.Points) == 0 {
@@ -568,6 +588,176 @@ func (s *dut1Service) fetchNTSCList(ctx context.Context) (*ntscDataListEntry, er
 		return nil, fmt.Errorf("no NTSC_EOP_yyyyMMdd file found in data list")
 	}
 	return latest, nil
+}
+
+// refreshIERSMirror obtains the IERS Bulletin A from NTSC's mirror. It runs
+// only after every configured IERS URL failed. Listings and the bulletin file
+// are cached; the mirror is re-resolved at most once per mirror refresh
+// interval, so a long IERS outage does not turn into a polling loop.
+func (s *dut1Service) refreshIERSMirror(ctx context.Context) error {
+	now := time.Now().UTC()
+
+	s.mu.RLock()
+	mirrorAt := s.iersMirrorAt
+	attemptAt := s.iersMirrorAttemptAt
+	hasPoints := len(s.points) > 0
+	s.mu.RUnlock()
+
+	if !mirrorAt.IsZero() && now.Sub(mirrorAt) < s.iersMirrorRefresh {
+		return nil
+	}
+	if !attemptAt.IsZero() && now.Sub(attemptAt) < s.iersMirrorRetry {
+		if mirrorAt.IsZero() || !hasPoints {
+			return fmt.Errorf("retry throttled")
+		}
+		// Keep serving the previous mirror copy until the retry window opens.
+		return nil
+	}
+
+	s.mu.Lock()
+	s.iersMirrorAttemptAt = now
+	s.mu.Unlock()
+
+	body, fileURL, fileName, err := s.resolveNTSCBulletinA(ctx)
+	if err != nil {
+		return err
+	}
+	points, err := parseDUT1Text(string(body))
+	if err != nil {
+		return fmt.Errorf("parse NTSC IERS mirror %s: %w", fileName, err)
+	}
+
+	s.mu.Lock()
+	s.iersMirrorURL = fileURL
+	s.iersMirrorName = fileName
+	s.iersMirrorAt = time.Now().UTC()
+	s.mu.Unlock()
+	s.storePoints(points, "IERS Bulletin A (NTSC mirror)", fileURL)
+	s.logger.Info("", "IERS Bulletin A loaded from NTSC mirror", map[string]interface{}{
+		"file":   fileName,
+		"source": fileURL,
+		"days":   len(points),
+	})
+	return nil
+}
+
+var (
+	ntscBulletinAProductPattern = regexp.MustCompile(`(?s)href="([^"]*erpFile[^"]*)"[^>]*>\s*Bulletin[ _-]?A\s*</a>`)
+	ntscVolumeLinkPattern       = regexp.MustCompile(`(?s)href="([^"]*erpFile[^"]*)"[^>]*>\s*([0-9]{2}-volume-[^<]*?)\s*</a>`)
+	ntscBulletinLinkPattern     = regexp.MustCompile(`href="(https?://[^"]*?/IERS/bulletina/[^"]*?/bulletina-[a-z]+-(\d{3})\.txt)"`)
+)
+
+// resolveNTSCBulletinA walks the NTSC IERS product pages and returns the newest
+// Bulletin A file for the current year. The mirror URL is predictable only
+// through these small listing pages, so resolve them instead of scraping a
+// hard-coded file number.
+func (s *dut1Service) resolveNTSCBulletinA(ctx context.Context) ([]byte, string, string, error) {
+	listURL := s.ntscBaseURL + "/page/dataInternetList"
+	listHTML, err := s.fetchHTML(ctx, listURL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("NTSC IERS product list: %w", err)
+	}
+
+	productHref := ""
+	if match := ntscBulletinAProductPattern.FindStringSubmatch(string(listHTML)); len(match) >= 2 {
+		productHref = strings.ReplaceAll(match[1], "&amp;", "&")
+	}
+	if productHref == "" {
+		return nil, "", "", fmt.Errorf("no Bulletin A product entry found on NTSC IERS page")
+	}
+	productURL := absoluteNTSCPageURL(s.ntscBaseURL, productHref)
+	productHTML, err := s.fetchHTML(ctx, productURL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("NTSC Bulletin A product page: %w", err)
+	}
+
+	bestVolume := -1
+	volumeHref := ""
+	for _, match := range ntscVolumeLinkPattern.FindAllStringSubmatch(string(productHTML), -1) {
+		label := strings.TrimSpace(match[2])
+		volumeNumber, err := strconv.Atoi(label[:2])
+		if err != nil {
+			continue
+		}
+		// Bulletin A volume numbers increase every year; the newest volume is
+		// the highest number listed, not a year-label match.
+		if volumeNumber > bestVolume {
+			bestVolume = volumeNumber
+			volumeHref = strings.ReplaceAll(match[1], "&amp;", "&")
+		}
+	}
+	if volumeHref == "" {
+		return nil, "", "", fmt.Errorf("no current IERS Bulletin A volume found")
+	}
+	volumeURL := absoluteNTSCPageURL(s.ntscBaseURL, volumeHref)
+
+	volumeHTML, err := s.fetchHTML(ctx, volumeURL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("NTSC IERS volume page: %w", err)
+	}
+	bestIssue := -1
+	bestFileURL := ""
+	for _, match := range ntscBulletinLinkPattern.FindAllStringSubmatch(string(volumeHTML), -1) {
+		issue, err := strconv.Atoi(match[2])
+		if err != nil || issue <= bestIssue {
+			continue
+		}
+		bestIssue = issue
+		bestFileURL = strings.ReplaceAll(match[1], "&amp;", "&")
+	}
+	if bestFileURL == "" {
+		return nil, "", "", fmt.Errorf("no Bulletin A file found in NTSC mirror volume page")
+	}
+	body, err := s.fetchSource(ctx, bestFileURL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("download NTSC IERS mirror: %w", err)
+	}
+	return body, bestFileURL, filepath.Base(bestFileURL), nil
+}
+
+func absoluteNTSCPageURL(baseURL, href string) string {
+	raw := href
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if !parsed.IsAbs() {
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			return raw
+		}
+		parsed = base.ResolveReference(parsed)
+	}
+	// The NTSC product links contain raw Chinese in the query string. Re-encode
+	// the parsed query so Go's HTTP client sends a valid request target.
+	query := parsed.Query()
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func (s *dut1Service) fetchHTML(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "time-api/1.2 (DUT1 provider)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("empty response body")
+	}
+	return body, nil
 }
 
 func (s *dut1Service) fetchSource(ctx context.Context, url string) ([]byte, error) {
@@ -726,42 +916,13 @@ func dut1InfoFor(at time.Time, mode string) DUT1Info {
 	case "iers":
 		service = dut1
 	default:
-		var iersInfo, ntscInfo *DUT1Info
-		if dut1 != nil {
-			info := dut1.Info(at)
-			iersInfo = &info
-		}
-		if dut1NTSC != nil {
-			info := dut1NTSC.Info(at)
-			ntscInfo = &info
-		}
-		iersFresh := iersInfo != nil && iersInfo.Available && !iersInfo.Stale
-		ntscFresh := ntscInfo != nil && ntscInfo.Available && !ntscInfo.Stale
-
-		// Prefer a fresh IERS value. NTSC is a backup: it is selected only when
-		// IERS is stale/missing, or when the IERS cache is not usable at all.
-		switch {
-		case iersFresh:
-			service = dut1
-		case ntscFresh:
+		// IERS is the primary product. Its provider falls back to the NTSC-hosted
+		// IERS Bulletin A copy when the official host is unreachable. The NTSC
+		// EOP product is an independent peer source, not an automatic backup, so
+		// auto never substitutes it; clients can request source=ntsc explicitly.
+		service = dut1
+		if service == nil {
 			service = dut1NTSC
-		case iersInfo != nil && iersInfo.Available:
-			service = dut1
-		case ntscInfo != nil && ntscInfo.Available:
-			service = dut1NTSC
-		default:
-			service = dut1
-			if service == nil {
-				service = dut1NTSC
-			}
-		}
-
-		// Only start the NTSC fallback network path when IERS has no fresh value,
-		// or when the primary refresh has failed (warm up the backup before the
-		// last-good IERS cache crosses its stale threshold).
-		primaryRefreshFailed := dut1 != nil && dut1.refreshFailed()
-		if dut1NTSC != nil && !ntscFresh && (!iersFresh || primaryRefreshFailed) {
-			dut1NTSC.EnsureStarted()
 		}
 	}
 	if service == nil {
