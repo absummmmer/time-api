@@ -38,6 +38,8 @@ type dut1CacheSnapshot struct {
 	SourceURL      string               `json:"source_url"`
 	UpdatedAt      time.Time            `json:"updated_at"`
 	Points         map[string]DUT1Point `json:"points"`
+	PublishedAt    string               `json:"published_at,omitempty"`
+	Bulletin       string               `json:"bulletin,omitempty"`
 	NTSCLatestID   int                  `json:"ntsc_latest_id,omitempty"`
 	NTSCLatestName string               `json:"ntsc_latest_name,omitempty"`
 	IERSMirrorURL  string               `json:"iers_mirror_url,omitempty"`
@@ -57,48 +59,54 @@ type DUT1Point struct {
 // DUT1SourceSnapshot is the alternate source's view of the same UTC date.
 // It lets the UI show both sources and switch without a second round-trip.
 type DUT1SourceSnapshot struct {
-	Source    string     `json:"source"`
-	SourceKey string     `json:"source_key,omitempty"`
-	UpdatedAt string     `json:"updated_at,omitempty"`
-	Stale     bool       `json:"stale"`
-	Available bool       `json:"available"`
-	Previous  *DUT1Point `json:"previous,omitempty"`
-	Current   *DUT1Point `json:"current,omitempty"`
-	Next      *DUT1Point `json:"next,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	Source      string     `json:"source"`
+	SourceKey   string     `json:"source_key,omitempty"`
+	UpdatedAt   string     `json:"updated_at,omitempty"`
+	PublishedAt string     `json:"published_at,omitempty"`
+	Bulletin    string     `json:"bulletin,omitempty"`
+	Stale       bool       `json:"stale"`
+	Available   bool       `json:"available"`
+	Previous    *DUT1Point `json:"previous,omitempty"`
+	Current     *DUT1Point `json:"current,omitempty"`
+	Next        *DUT1Point `json:"next,omitempty"`
+	Error       string     `json:"error,omitempty"`
 }
 
 // DUT1Info is the API representation of the DUT1 value for one UTC date and
 // its two neighbouring dates. The neighbouring values let a client roll over
 // at UTC midnight without performing an extra request.
 type DUT1Info struct {
-	Date       string              `json:"date"`
-	DateBasis  string              `json:"date_basis"`
-	Unit       string              `json:"unit"`
-	Source     string              `json:"source"`
-	SourceKey  string              `json:"source_key,omitempty"`
-	SourceMode string              `json:"source_mode,omitempty"`
-	SourceURL  string              `json:"source_url,omitempty"`
-	UpdatedAt  string              `json:"updated_at,omitempty"`
-	Stale      bool                `json:"stale"`
-	Available  bool                `json:"available"`
-	Previous   *DUT1Point          `json:"previous"`
-	Current    *DUT1Point          `json:"current"`
-	Next       *DUT1Point          `json:"next"`
-	Alternate  *DUT1SourceSnapshot `json:"alternate,omitempty"`
-	Error      string              `json:"error,omitempty"`
+	Date        string              `json:"date"`
+	DateBasis   string              `json:"date_basis"`
+	Unit        string              `json:"unit"`
+	Source      string              `json:"source"`
+	SourceKey   string              `json:"source_key,omitempty"`
+	SourceMode  string              `json:"source_mode,omitempty"`
+	SourceURL   string              `json:"source_url,omitempty"`
+	UpdatedAt   string              `json:"updated_at,omitempty"`
+	PublishedAt string              `json:"published_at,omitempty"`
+	Bulletin    string              `json:"bulletin,omitempty"`
+	Stale       bool                `json:"stale"`
+	Available   bool                `json:"available"`
+	Previous    *DUT1Point          `json:"previous"`
+	Current     *DUT1Point          `json:"current"`
+	Next        *DUT1Point          `json:"next"`
+	Alternate   *DUT1SourceSnapshot `json:"alternate,omitempty"`
+	Error       string              `json:"error,omitempty"`
 }
 
 // dut1Service periodically downloads and caches an Earth-orientation data
 // file (IERS Bulletin A by default) and serves DUT1 values from memory.
 type dut1Service struct {
-	mu        sync.RWMutex
-	points    map[string]DUT1Point // key: YYYY-MM-DD (UTC)
-	source    string
-	sourceKey string
-	sourceURL string
-	updatedAt time.Time
-	lastErr   error
+	mu          sync.RWMutex
+	points      map[string]DUT1Point // key: YYYY-MM-DD (UTC)
+	source      string
+	sourceKey   string
+	sourceURL   string
+	updatedAt   time.Time
+	publishedAt string
+	bulletin    string
+	lastErr     error
 
 	mode        string
 	ntscBaseURL string
@@ -300,11 +308,14 @@ func (s *dut1Service) refreshOnce(ctx context.Context) error {
 			failures = append(failures, fmt.Sprintf("%s: %v", url, err))
 			continue
 		}
+		publishedAt, bulletin := parseDUT1Publication(string(body))
 
-		s.storePoints(points, dut1SourceName(url), url)
+		s.storePoints(points, dut1SourceName(url), url, publishedAt, bulletin)
 		s.logger.Info("", "DUT1 data loaded", map[string]interface{}{
-			"source": url,
-			"days":   len(points),
+			"source":       url,
+			"days":         len(points),
+			"published_at": publishedAt,
+			"bulletin":     bulletin,
 		})
 		return nil
 	}
@@ -327,11 +338,13 @@ func (s *dut1Service) refreshOnce(ctx context.Context) error {
 	return err
 }
 
-func (s *dut1Service) storePoints(points map[string]DUT1Point, source, sourceURL string) {
+func (s *dut1Service) storePoints(points map[string]DUT1Point, source, sourceURL, publishedAt, bulletin string) {
 	s.mu.Lock()
 	s.points = points
 	s.source = source
 	s.sourceURL = sourceURL
+	s.publishedAt = publishedAt
+	s.bulletin = bulletin
 	s.updatedAt = time.Now().UTC()
 	s.lastErr = nil
 	s.mu.Unlock()
@@ -367,8 +380,15 @@ func (s *dut1Service) cacheIsFresh(now time.Time) bool {
 	s.mu.RLock()
 	updatedAt := s.updatedAt
 	points := s.points
+	publishedAt := s.publishedAt
 	s.mu.RUnlock()
 	if updatedAt.IsZero() || len(points) == 0 || now.Sub(updatedAt) >= s.refresh {
+		return false
+	}
+	// Old snapshots written before publication metadata existed must be
+	// refreshed once so the UI can show the bulletin/file age, even when the
+	// numeric point cache itself is still young.
+	if publishedAt == "" {
 		return false
 	}
 	_, hasToday := points[now.UTC().Format("2006-01-02")]
@@ -413,6 +433,8 @@ func (s *dut1Service) LoadCache() {
 		s.points = snapshot.Points
 		s.source = source
 		s.sourceURL = snapshot.SourceURL
+		s.publishedAt = snapshot.PublishedAt
+		s.bulletin = snapshot.Bulletin
 		s.updatedAt = snapshot.UpdatedAt
 		s.ntscLatestID = snapshot.NTSCLatestID
 		s.ntscLatestName = snapshot.NTSCLatestName
@@ -443,6 +465,8 @@ func (s *dut1Service) saveCache() {
 		SourceURL:      s.sourceURL,
 		UpdatedAt:      s.updatedAt,
 		Points:         s.points,
+		PublishedAt:    s.publishedAt,
+		Bulletin:       s.bulletin,
 		NTSCLatestID:   s.ntscLatestID,
 		NTSCLatestName: s.ntscLatestName,
 		IERSMirrorURL:  s.iersMirrorURL,
@@ -489,8 +513,9 @@ func (s *dut1Service) refreshNTSC(ctx context.Context) error {
 	s.mu.RLock()
 	cachedID := s.ntscLatestID
 	hasCachedPoints := len(s.points) > 0
+	publishedAt := s.publishedAt
 	s.mu.RUnlock()
-	if latest.ID > 0 && latest.ID == cachedID && hasCachedPoints {
+	if latest.ID > 0 && latest.ID == cachedID && hasCachedPoints && publishedAt != "" {
 		s.logger.Info("", "NTSC EOP file unchanged; download skipped", map[string]interface{}{
 			"file": latest.FileName,
 			"id":   latest.ID,
@@ -514,15 +539,17 @@ func (s *dut1Service) refreshNTSC(ctx context.Context) error {
 		s.mu.Unlock()
 		return wrapped
 	}
+	publishedAt, bulletin := ntscPublicationMeta(latest)
 	s.mu.Lock()
 	s.ntscLatestID = latest.ID
 	s.ntscLatestName = latest.FileName
 	s.mu.Unlock()
-	s.storePoints(points, "NTSC EOP", downloadURL)
+	s.storePoints(points, "NTSC EOP", downloadURL, publishedAt, bulletin)
 	s.logger.Info("", "NTSC DUT1 data loaded", map[string]interface{}{
-		"source": downloadURL,
-		"file":   latest.FileName,
-		"days":   len(points),
+		"source":       downloadURL,
+		"file":         latest.FileName,
+		"days":         len(points),
+		"published_at": publishedAt,
 	})
 	return nil
 }
@@ -601,17 +628,18 @@ func (s *dut1Service) refreshIERSMirror(ctx context.Context) error {
 	mirrorAt := s.iersMirrorAt
 	attemptAt := s.iersMirrorAttemptAt
 	hasPoints := len(s.points) > 0
+	publishedAt := s.publishedAt
 	s.mu.RUnlock()
 
-	if !mirrorAt.IsZero() && now.Sub(mirrorAt) < s.iersMirrorRefresh {
+	if !mirrorAt.IsZero() && now.Sub(mirrorAt) < s.iersMirrorRefresh && publishedAt != "" {
 		return nil
 	}
 	if !attemptAt.IsZero() && now.Sub(attemptAt) < s.iersMirrorRetry {
-		if mirrorAt.IsZero() || !hasPoints {
-			return fmt.Errorf("retry throttled")
+		if hasPoints && publishedAt != "" {
+			// Keep serving the previous mirror copy until the retry window opens.
+			return nil
 		}
-		// Keep serving the previous mirror copy until the retry window opens.
-		return nil
+		return fmt.Errorf("retry throttled")
 	}
 
 	s.mu.Lock()
@@ -626,17 +654,19 @@ func (s *dut1Service) refreshIERSMirror(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("parse NTSC IERS mirror %s: %w", fileName, err)
 	}
+	publishedAt, bulletin := parseDUT1Publication(string(body))
 
 	s.mu.Lock()
 	s.iersMirrorURL = fileURL
 	s.iersMirrorName = fileName
 	s.iersMirrorAt = time.Now().UTC()
 	s.mu.Unlock()
-	s.storePoints(points, "IERS Bulletin A (NTSC mirror)", fileURL)
+	s.storePoints(points, "IERS Bulletin A (NTSC mirror)", fileURL, publishedAt, bulletin)
 	s.logger.Info("", "IERS Bulletin A loaded from NTSC mirror", map[string]interface{}{
-		"file":   fileName,
-		"source": fileURL,
-		"days":   len(points),
+		"file":         fileName,
+		"source":       fileURL,
+		"days":         len(points),
+		"published_at": publishedAt,
 	})
 	return nil
 }
@@ -811,17 +841,21 @@ func (s *dut1Service) Info(at time.Time) DUT1Info {
 	sourceKey := s.sourceKey
 	sourceURL := s.sourceURL
 	updatedAt := s.updatedAt
+	publishedAt := s.publishedAt
+	bulletin := s.bulletin
 	lastErr := s.lastErr
 	s.mu.RUnlock()
 
 	info := DUT1Info{
-		Date:      date,
-		DateBasis: "UTC",
-		Unit:      "s",
-		Source:    source,
-		SourceKey: sourceKey,
-		SourceURL: sourceURL,
-		Stale:     true,
+		Date:        date,
+		DateBasis:   "UTC",
+		Unit:        "s",
+		Source:      source,
+		SourceKey:   sourceKey,
+		SourceURL:   sourceURL,
+		PublishedAt: publishedAt,
+		Bulletin:    bulletin,
+		Stale:       true,
 	}
 	if info.Source == "" {
 		info.Source = "IERS Bulletin A"
@@ -873,15 +907,17 @@ func alternateDUT1Snapshot(activeKey string, at time.Time) *DUT1SourceSnapshot {
 	}
 	info := other.Info(at)
 	return &DUT1SourceSnapshot{
-		Source:    info.Source,
-		SourceKey: info.SourceKey,
-		UpdatedAt: info.UpdatedAt,
-		Stale:     info.Stale,
-		Available: info.Available,
-		Previous:  info.Previous,
-		Current:   info.Current,
-		Next:      info.Next,
-		Error:     info.Error,
+		Source:      info.Source,
+		SourceKey:   info.SourceKey,
+		UpdatedAt:   info.UpdatedAt,
+		PublishedAt: info.PublishedAt,
+		Bulletin:    info.Bulletin,
+		Stale:       info.Stale,
+		Available:   info.Available,
+		Previous:    info.Previous,
+		Current:     info.Current,
+		Next:        info.Next,
+		Error:       info.Error,
 	}
 }
 
@@ -939,6 +975,49 @@ func dut1InfoFor(at time.Time, mode string) DUT1Info {
 	info.SourceMode = normalized
 	info.Alternate = alternateDUT1Snapshot(info.SourceKey, at)
 	return info
+}
+
+var iersBulletinDatePattern = regexp.MustCompile(`(?i)^\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s+Vol\.\s*([IVXLCDM]+)\s+No\.\s*(\d+)`)
+
+// parseDUT1Publication extracts the bulletin/file publication date and issue
+// label from an IERS Bulletin A header. The row dates in the table are value
+// dates, which are not the same as the date on which the bulletin was issued.
+func parseDUT1Publication(text string) (string, string) {
+	for _, line := range strings.Split(text, "\n") {
+		match := iersBulletinDatePattern.FindStringSubmatch(line)
+		if len(match) < 6 {
+			continue
+		}
+		dateText := fmt.Sprintf("%s %s %s", match[1], match[2], match[3])
+		parsed, err := time.Parse("2 January 2006", dateText)
+		if err != nil {
+			continue
+		}
+		return parsed.Format("2006-01-02"), fmt.Sprintf("Vol. %s No. %s", match[4], match[5])
+	}
+	return "", ""
+}
+
+// ntscPublicationMeta uses the daily NTSC_EOP_yyyyMMdd filename as the
+// publication date, falling back to the listing's createTime. The NTSC data
+// file itself has no IERS-style bulletin header.
+func ntscPublicationMeta(entry *ntscDataListEntry) (string, string) {
+	if entry == nil {
+		return "", ""
+	}
+	name := strings.TrimSpace(entry.FileName)
+	if strings.HasPrefix(name, "NTSC_EOP_") {
+		raw := strings.TrimPrefix(name, "NTSC_EOP_")
+		if len(raw) == 8 && isDigits(raw) {
+			if parsed, err := time.Parse("20060102", raw); err == nil {
+				return parsed.Format("2006-01-02"), name
+			}
+		}
+	}
+	if parsed, err := time.Parse("2006-01-02 15:04:05", strings.TrimSpace(entry.CreateTime)); err == nil {
+		return parsed.Format("2006-01-02"), name
+	}
+	return "", name
 }
 
 // parseDUT1Text understands both IERS Bulletin A (observed + prediction

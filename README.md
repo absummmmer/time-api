@@ -89,6 +89,8 @@ The response includes the usual date/time fields and a `dut1` object:
     "source": "IERS Bulletin A",
     "source_key": "iers",
     "source_mode": "auto",
+    "published_at": "2026-10-20",
+    "bulletin": "Vol. XXXIX No. 001",
     "stale": false,
     "available": true,
     "previous": { "date": "2026-10-17", "mjd": 61330, "value": -0.03769, "dut1": 0, "type": "predicted" },
@@ -205,6 +207,15 @@ Values are in seconds. `dut1` is the same value rounded to the 0.1 s step used b
 time-signal broadcasts. `type` is `observed` or `predicted`. If no value exists
 for the requested date, the endpoint still returns HTTP 200 with
 `"available": false` and an `error` field.
+
+The per-point `date` is the **value date**. Top-level `published_at` and
+`alternate.published_at` are the dates on which the upstream bulletin/file was
+issued (IERS Bulletin A issue date, or the `NTSC_EOP_yyyyMMdd` file date); they
+are not the value date. `bulletin`/`alternate.bulletin` carry the issue label
+(for example `Vol. XXXIX No. 046`) or NTSC filename when available. These fields
+let a client distinguish a fresh daily file from an older weekly bulletin or a
+stale mirror. `updated_at` is when this server last refreshed the data, not the
+publication date.
 
 ### `GET /v1/timezones`
 

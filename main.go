@@ -649,6 +649,16 @@ const openAPISpec = `{
             "format": "date-time",
             "description": "Time of the most recent successful refresh"
           },
+          "published_at": {
+            "type": "string",
+            "example": "2026-11-12",
+            "description": "Publication date of the upstream bulletin/file (not the value date)"
+          },
+          "bulletin": {
+            "type": "string",
+            "example": "Vol. XXXIX No. 046",
+            "description": "Upstream bulletin/file label when available"
+          },
           "stale": {
             "type": "boolean",
             "description": "True when the cached data is older than the configured threshold"
@@ -689,6 +699,14 @@ const openAPISpec = `{
           },
           "updated_at": {
             "type": "string"
+          },
+          "published_at": {
+            "type": "string",
+            "description": "Publication date of this alternate source's bulletin/file"
+          },
+          "bulletin": {
+            "type": "string",
+            "description": "Alternate source bulletin/file label"
           },
           "stale": {
             "type": "boolean"
@@ -889,6 +907,8 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
     "source": "IERS Bulletin A",
     "stale": false,
     "available": true,
+    "published_at": "2026-10-20",
+    "bulletin": "Vol. XXXIX No. 001",
     "previous": { "date": "2021-10-17", "value": 0.0312, "dut1": 0, "type": "observed" },
     "current":  { "date": "2021-10-18", "value": 0.0298, "dut1": 0, "type": "observed" },
     "next":     { "date": "2021-10-19", "value": 0.0284, "dut1": 0, "type": "predicted" }
@@ -915,6 +935,8 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
   "source_mode": "auto",
   "source_url": "https://datacenter.iers.org/data/latestVersion/bulletinA.txt",
   "updated_at": "2026-10-18T08:00:00Z",
+  "published_at": "2026-10-20",
+  "bulletin": "Vol. XXXIX No. 001",
   "stale": false,
   "available": true,
   "previous": { "date": "2026-10-17", "mjd": 61330, "value": -0.03769, "dut1": 0, "type": "predicted" },

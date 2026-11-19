@@ -14,6 +14,7 @@ import (
 )
 
 const bulletinSample = `
+      20 October 2026                                     Vol. XXXIX No. 001
       **********************************************************************
       *                   I E R S   B U L L E T I N - A                    *
       **********************************************************************
@@ -47,6 +48,10 @@ const bulletinSample = `
 `
 
 func TestParseDUT1BulletinA(t *testing.T) {
+	publishedAt, bulletin := parseDUT1Publication(bulletinSample)
+	if publishedAt != "2026-10-20" || bulletin != "Vol. XXXIX No. 001" {
+		t.Fatalf("publication = %q / %q, want 2026-10-20 / Vol. XXXIX No. 001", publishedAt, bulletin)
+	}
 	points, err := parseDUT1Text(bulletinSample)
 	if err != nil {
 		t.Fatalf("parseDUT1Text returned error: %v", err)
@@ -150,6 +155,9 @@ func TestNTSCServiceRefresh(t *testing.T) {
 	if !info.Available || info.SourceKey != "ntsc" || info.Source != "NTSC EOP" {
 		t.Fatalf("unexpected NTSC info: %+v", info)
 	}
+	if info.PublishedAt != "2026-11-03" || info.Bulletin != "NTSC_EOP_20261103" {
+		t.Fatalf("NTSC publication = %q / %q, want 2026-11-03 / NTSC_EOP_20261103", info.PublishedAt, info.Bulletin)
+	}
 	if info.Current == nil || info.Current.Type != "predicted" {
 		t.Fatalf("unexpected current point: %+v", info.Current)
 	}
@@ -166,19 +174,23 @@ func TestAlternateDUT1Snapshot(t *testing.T) {
 	defer func() { dut1, dut1NTSC = oldIERS, oldNTSC }()
 	now := time.Now().UTC()
 	dut1 = &dut1Service{
-		source:     "IERS Bulletin A",
-		sourceKey:  "iers",
-		updatedAt:  now,
-		staleAfter: time.Hour,
+		source:      "IERS Bulletin A",
+		sourceKey:   "iers",
+		publishedAt: "2026-10-20",
+		bulletin:    "Vol. XXXIX No. 001",
+		updatedAt:   now,
+		staleAfter:  time.Hour,
 		points: map[string]DUT1Point{
 			"2026-11-03": {Date: "2026-11-03", Value: -0.0581, Type: "predicted"},
 		},
 	}
 	dut1NTSC = &dut1Service{
-		source:     "NTSC EOP",
-		sourceKey:  "ntsc",
-		updatedAt:  now,
-		staleAfter: time.Hour,
+		source:      "NTSC EOP",
+		sourceKey:   "ntsc",
+		publishedAt: "2026-11-03",
+		bulletin:    "NTSC_EOP_20261103",
+		updatedAt:   now,
+		staleAfter:  time.Hour,
 		points: map[string]DUT1Point{
 			"2026-11-03": {Date: "2026-11-03", Value: -0.0568, Type: "predicted"},
 		},
@@ -187,6 +199,9 @@ func TestAlternateDUT1Snapshot(t *testing.T) {
 	snapshot := alternateDUT1Snapshot("ntsc", at)
 	if snapshot == nil || snapshot.SourceKey != "iers" || snapshot.Current == nil {
 		t.Fatalf("unexpected alternate snapshot: %+v", snapshot)
+	}
+	if snapshot.PublishedAt != "2026-10-20" || snapshot.Bulletin != "Vol. XXXIX No. 001" {
+		t.Fatalf("alternate publication = %q / %q", snapshot.PublishedAt, snapshot.Bulletin)
 	}
 	if math.Abs(snapshot.Current.Value-(-0.0581)) > 1e-12 {
 		t.Fatalf("alternate current value = %v, want -0.0581", snapshot.Current.Value)
@@ -279,6 +294,9 @@ func TestDUT1ServiceRefresh(t *testing.T) {
 	if info.Source != "IERS Bulletin A" {
 		t.Errorf("source = %q, want IERS Bulletin A", info.Source)
 	}
+	if info.PublishedAt != "2026-10-20" || info.Bulletin != "Vol. XXXIX No. 001" {
+		t.Errorf("publication = %q / %q, want 2026-10-20 / Vol. XXXIX No. 001", info.PublishedAt, info.Bulletin)
+	}
 	if !info.Available {
 		t.Fatal("refreshed service has no current DUT1 value")
 	}
@@ -289,14 +307,16 @@ func TestDUT1CacheRoundTrip(t *testing.T) {
 	now := time.Now().UTC()
 	day := now.Format("2006-01-02")
 	src := &dut1Service{
-		sourceKey:  "ntsc",
-		source:     "NTSC EOP",
-		sourceURL:  "http://example.invalid/eop",
-		updatedAt:  now,
-		refresh:    24 * time.Hour,
-		staleAfter: 48 * time.Hour,
-		cacheDir:   dir,
-		logger:     NewJSONLogger(io.Discard),
+		sourceKey:   "ntsc",
+		source:      "NTSC EOP",
+		sourceURL:   "http://example.invalid/eop",
+		publishedAt: "2026-11-03",
+		bulletin:    "NTSC_EOP_20261103",
+		updatedAt:   now,
+		refresh:     24 * time.Hour,
+		staleAfter:  48 * time.Hour,
+		cacheDir:    dir,
+		logger:      NewJSONLogger(io.Discard),
 	}
 	src.mu.Lock()
 	src.points = map[string]DUT1Point{day: {Date: day, Value: -0.0568, DUT1: -0.1, Type: "predicted"}}
@@ -317,6 +337,9 @@ func TestDUT1CacheRoundTrip(t *testing.T) {
 	}
 	if info.Current == nil || math.Abs(info.Current.Value-(-0.0568)) > 1e-12 {
 		t.Fatalf("unexpected restored current: %+v", info.Current)
+	}
+	if info.PublishedAt != "2026-11-03" || info.Bulletin != "NTSC_EOP_20261103" {
+		t.Fatalf("restored publication = %q / %q", info.PublishedAt, info.Bulletin)
 	}
 	if !restored.cacheIsFresh(now) {
 		t.Fatal("restored cache should be fresh for today's date")
@@ -414,6 +437,9 @@ func TestIERSMirrorFallback(t *testing.T) {
 	info := svc.Info(time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC))
 	if !info.Available || info.SourceKey != "iers" || !strings.Contains(info.Source, "NTSC mirror") {
 		t.Fatalf("unexpected IERS mirror info: %+v", info)
+	}
+	if info.PublishedAt != "2026-10-20" || info.Bulletin != "Vol. XXXIX No. 001" {
+		t.Fatalf("mirror publication = %q / %q", info.PublishedAt, info.Bulletin)
 	}
 	if listRequests.Load() != 1 || volumeRequests.Load() != 2 || fileRequests.Load() != 1 {
 		t.Fatalf("unexpected mirror requests: list=%d volume=%d file=%d", listRequests.Load(), volumeRequests.Load(), fileRequests.Load())
