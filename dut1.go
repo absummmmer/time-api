@@ -25,8 +25,14 @@ const (
 	defaultNTSCRefresh       = 24 * time.Hour
 	defaultNTSCRetry         = time.Hour
 	defaultIERSMirrorRefresh = 24 * time.Hour
-	defaultIERSMirrorRetry   = time.Hour
+	defaultIERSMirrorRetry   = 15 * time.Minute
 	defaultNTSCBaseURL       = "http://www.ut1.ntsc.ac.cn"
+	defaultIERSWeekday       = time.Thursday
+	defaultNTSCFollowupRetry = 10 * time.Minute
+	defaultNTSCFollowupMax   = 2 * time.Hour
+	defaultIERSFollowupRetry = 15 * time.Minute
+	defaultIERSFollowupMax   = 6 * time.Hour
+	publicationGrace         = 10 * time.Minute
 )
 
 // dut1CacheSnapshot is the on-disk form of one provider's last-good data. It
@@ -119,6 +125,17 @@ type dut1Service struct {
 	logger      *JSONLogger
 	cacheDir    string
 
+	scheduleKind     string
+	scheduleLoc      *time.Location
+	scheduleWeekday  time.Weekday
+	scheduleHour     int
+	scheduleMinute   int
+	publicationGrace time.Duration
+	followupRetry    time.Duration
+	followupMax      time.Duration
+	followupAttempt  int
+	scheduleTarget   time.Time
+
 	startOnce      sync.Once
 	ntscLatestID   int
 	ntscLatestName string
@@ -170,6 +187,13 @@ func newDUT1Service(logger *JSONLogger) *dut1Service {
 	if mirrorRetry < 5*time.Minute {
 		mirrorRetry = 5 * time.Minute
 	}
+	iersHour, iersMinute := envClock("DUT1_IERS_PUBLICATION_TIME", 17, 40)
+	iersWeekday := envWeekday("DUT1_IERS_PUBLICATION_WEEKDAY", defaultIERSWeekday)
+	iersFollowupRetry := envDuration("DUT1_IERS_FOLLOWUP_RETRY", defaultIERSFollowupRetry)
+	iersFollowupMax := envDuration("DUT1_IERS_FOLLOWUP_MAX", defaultIERSFollowupMax)
+	if iersFollowupMax < iersFollowupRetry {
+		iersFollowupMax = iersFollowupRetry
+	}
 
 	return &dut1Service{
 		mode:        "url",
@@ -183,6 +207,14 @@ func newDUT1Service(logger *JSONLogger) *dut1Service {
 		client: &http.Client{
 			Timeout: timeout,
 		},
+		scheduleKind:      "weekly",
+		scheduleLoc:       time.UTC,
+		scheduleWeekday:   iersWeekday,
+		scheduleHour:      iersHour,
+		scheduleMinute:    iersMinute,
+		publicationGrace:  publicationGrace,
+		followupRetry:     iersFollowupRetry,
+		followupMax:       iersFollowupMax,
 		logger:            logger,
 		cacheDir:          strings.TrimSpace(os.Getenv("DUT1_CACHE_DIR")),
 		iersMirrorEnabled: envBool("DUT1_IERS_MIRROR_ENABLED", true),
@@ -208,6 +240,17 @@ func newNTSCDUT1Service(logger *JSONLogger) *dut1Service {
 	if service.staleAfter < service.refresh {
 		service.staleAfter = 2 * service.refresh
 	}
+	ntscHour, ntscMinute := envClock("DUT1_NTSC_PUBLICATION_TIME", 15, 30)
+	service.scheduleKind = "daily"
+	service.scheduleLoc = time.FixedZone("CST", 8*60*60)
+	service.scheduleHour = ntscHour
+	service.scheduleMinute = ntscMinute
+	service.publicationGrace = publicationGrace
+	service.followupRetry = envDuration("DUT1_NTSC_FOLLOWUP_RETRY", defaultNTSCFollowupRetry)
+	service.followupMax = envDuration("DUT1_NTSC_FOLLOWUP_MAX", defaultNTSCFollowupMax)
+	if service.followupMax < service.followupRetry {
+		service.followupMax = service.followupRetry
+	}
 	return service
 }
 
@@ -221,6 +264,120 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func envClock(name string, fallbackHour, fallbackMinute int) (int, int) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallbackHour, fallbackMinute
+	}
+	parsed, err := time.Parse("15:04", raw)
+	if err != nil {
+		parsed, err = time.Parse("15:04:05", raw)
+	}
+	if err != nil {
+		return fallbackHour, fallbackMinute
+	}
+	return parsed.Hour(), parsed.Minute()
+}
+
+func envWeekday(name string, fallback time.Weekday) time.Weekday {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		return fallback
+	}
+	if number, err := strconv.Atoi(raw); err == nil && number >= 0 && number <= 6 {
+		return time.Weekday(number)
+	}
+	for day := time.Sunday; day <= time.Saturday; day++ {
+		if strings.ToLower(day.String()) == raw || strings.ToLower(day.String()[:3]) == raw {
+			return day
+		}
+	}
+	return fallback
+}
+
+func (s *dut1Service) publicationTargets(now time.Time) (time.Time, time.Time) {
+	loc := s.scheduleLoc
+	if loc == nil {
+		loc = time.UTC
+	}
+	if s.scheduleKind == "daily" {
+		local := now.In(loc)
+		target := time.Date(local.Year(), local.Month(), local.Day(), s.scheduleHour, s.scheduleMinute, 0, 0, loc).Add(s.publicationGrace)
+		if target.After(now) {
+			target = target.AddDate(0, 0, -1)
+		}
+		return target, target.AddDate(0, 0, 1)
+	}
+	local := now.In(loc)
+	dayDelta := (int(local.Weekday()) - int(s.scheduleWeekday) + 7) % 7
+	target := time.Date(local.Year(), local.Month(), local.Day()-dayDelta, s.scheduleHour, s.scheduleMinute, 0, 0, loc).Add(s.publicationGrace)
+	if target.After(now) {
+		target = target.AddDate(0, 0, -7)
+	}
+	return target, target.AddDate(0, 0, 7)
+}
+
+func (s *dut1Service) publicationStaleAt(now time.Time) bool {
+	s.mu.RLock()
+	published := strings.TrimSpace(s.publishedAt)
+	s.mu.RUnlock()
+	if published == "" {
+		return true
+	}
+	publishedTime, err := time.Parse("2006-01-02", published)
+	if err != nil {
+		return true
+	}
+	latest, _ := s.publicationTargets(now)
+	return publishedTime.Format("2006-01-02") < latest.Format("2006-01-02")
+}
+
+// nextRefreshDelay aligns checks with the expected publication window and
+// backs off geometrically if the expected issue/file has not appeared yet.
+func (s *dut1Service) nextRefreshDelay(now time.Time) time.Duration {
+	latest, next := s.publicationTargets(now)
+	if !latest.Equal(s.scheduleTarget) {
+		s.scheduleTarget = latest
+		s.followupAttempt = 0
+	}
+	if !s.publicationStaleAt(now) {
+		s.followupAttempt = 0
+		delay := next.Sub(now)
+		if delay < time.Minute {
+			delay = time.Minute
+		}
+		return delay
+	}
+
+	s.followupAttempt++
+	exponent := s.followupAttempt - 1
+	if exponent > 8 {
+		exponent = 8
+	}
+	retry := s.followupRetry
+	if retry <= 0 {
+		retry = defaultIERSFollowupRetry
+	}
+	delay := retry * time.Duration(1<<exponent)
+	if s.followupMax > 0 && delay > s.followupMax {
+		delay = s.followupMax
+	}
+	if untilNext := next.Sub(now); untilNext > 0 && untilNext < delay {
+		delay = untilNext
+	}
+	if delay < time.Minute {
+		delay = time.Minute
+	}
+	return delay
+}
+
+func (s *dut1Service) failureDelay(now time.Time) time.Duration {
+	if s.publicationStaleAt(now) {
+		return s.nextRefreshDelay(now)
+	}
+	return s.retry
 }
 
 // Start performs an initial, best-effort refresh and then keeps the cache up
@@ -248,13 +405,14 @@ func (s *dut1Service) start(ctx context.Context) {
 	delay := s.refresh
 	if s.cacheIsFresh(time.Now()) {
 		age := s.cacheAge()
-		delay = s.refresh - age
+		delay = s.nextRefreshDelay(time.Now().UTC())
 		if delay < time.Minute {
 			delay = time.Minute
 		}
 		s.logger.Info("", "DUT1 cache is fresh; deferring upstream refresh", map[string]interface{}{
 			"source_key": s.sourceKey,
 			"cache_age":  age.String(),
+			"next_in":    delay.String(),
 		})
 	} else {
 		initCtx, cancel := context.WithTimeout(ctx, s.timeout)
@@ -262,7 +420,9 @@ func (s *dut1Service) start(ctx context.Context) {
 		cancel()
 		if err != nil {
 			s.logger.Error("", "Initial DUT1 refresh failed", map[string]interface{}{"error": err.Error()})
-			delay = s.retry
+			delay = s.failureDelay(time.Now().UTC())
+		} else {
+			delay = s.nextRefreshDelay(time.Now().UTC())
 		}
 	}
 	go s.run(ctx, delay)
@@ -281,10 +441,14 @@ func (s *dut1Service) run(ctx context.Context, delay time.Duration) {
 		cancel()
 		if err != nil {
 			s.logger.Error("", "DUT1 refresh failed", map[string]interface{}{"error": err.Error()})
-			delay = s.retry
+			delay = s.failureDelay(time.Now().UTC())
 			continue
 		}
-		delay = s.refresh
+		delay = s.nextRefreshDelay(time.Now().UTC())
+		s.logger.Info("", "DUT1 next refresh scheduled", map[string]interface{}{
+			"source_key": s.sourceKey,
+			"next_in":    delay.String(),
+		})
 	}
 }
 
@@ -628,14 +792,18 @@ func (s *dut1Service) refreshIERSMirror(ctx context.Context) error {
 	mirrorAt := s.iersMirrorAt
 	attemptAt := s.iersMirrorAttemptAt
 	hasPoints := len(s.points) > 0
-	publishedAt := s.publishedAt
 	s.mu.RUnlock()
 
-	if !mirrorAt.IsZero() && now.Sub(mirrorAt) < s.iersMirrorRefresh && publishedAt != "" {
+	stale := s.publicationStaleAt(now)
+	if !stale && !mirrorAt.IsZero() && now.Sub(mirrorAt) < s.iersMirrorRefresh {
 		return nil
 	}
-	if !attemptAt.IsZero() && now.Sub(attemptAt) < s.iersMirrorRetry {
-		if hasPoints && publishedAt != "" {
+	guard := s.iersMirrorRetry
+	if stale && s.followupRetry > 0 && s.followupRetry < guard {
+		guard = s.followupRetry
+	}
+	if !attemptAt.IsZero() && now.Sub(attemptAt) < guard {
+		if hasPoints {
 			// Keep serving the previous mirror copy until the retry window opens.
 			return nil
 		}
@@ -863,6 +1031,12 @@ func (s *dut1Service) Info(at time.Time) DUT1Info {
 	if !updatedAt.IsZero() {
 		info.UpdatedAt = updatedAt.Format(time.RFC3339)
 		info.Stale = time.Since(updatedAt) > s.staleAfter
+		if publishedAt != "" {
+			// Weekly/daily data remains current until the next publication
+			// window; do not mark it stale merely because no network check was
+			// needed between two issues.
+			info.Stale = s.publicationStaleAt(time.Now().UTC())
+		}
 	}
 
 	if len(points) == 0 {

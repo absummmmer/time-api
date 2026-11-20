@@ -489,6 +489,119 @@ func TestNTSCSkipsUnchangedFileDownload(t *testing.T) {
 	}
 }
 
+func TestDUT1PublicationSchedule(t *testing.T) {
+	cst := time.FixedZone("CST", 8*60*60)
+	daily := &dut1Service{
+		scheduleKind:     "daily",
+		scheduleLoc:      cst,
+		scheduleHour:     15,
+		scheduleMinute:   30,
+		publicationGrace: 10 * time.Minute,
+	}
+	now := time.Date(2026, 11, 20, 14, 0, 0, 0, cst)
+	latest, next := daily.publicationTargets(now)
+	wantLatest := time.Date(2026, 11, 19, 15, 40, 0, 0, cst)
+	wantNext := time.Date(2026, 11, 20, 15, 40, 0, 0, cst)
+	if !latest.Equal(wantLatest) || !next.Equal(wantNext) {
+		t.Fatalf("daily targets = %s / %s, want %s / %s", latest, next, wantLatest, wantNext)
+	}
+
+	weekly := &dut1Service{
+		scheduleKind:     "weekly",
+		scheduleLoc:      time.UTC,
+		scheduleWeekday:  time.Thursday,
+		scheduleHour:     17,
+		scheduleMinute:   40,
+		publicationGrace: 10 * time.Minute,
+	}
+	latest, next = weekly.publicationTargets(time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC))
+	wantLatest = time.Date(2026, 11, 19, 17, 50, 0, 0, time.UTC)
+	wantNext = time.Date(2026, 11, 26, 17, 50, 0, 0, time.UTC)
+	if !latest.Equal(wantLatest) || !next.Equal(wantNext) {
+		t.Fatalf("weekly targets = %s / %s, want %s / %s", latest, next, wantLatest, wantNext)
+	}
+}
+
+func TestDUT1PublicationAwareBackoff(t *testing.T) {
+	cst := time.FixedZone("CST", 8*60*60)
+	service := &dut1Service{
+		scheduleKind:     "daily",
+		scheduleLoc:      cst,
+		scheduleHour:     15,
+		scheduleMinute:   30,
+		publicationGrace: 10 * time.Minute,
+		followupRetry:    10 * time.Minute,
+		followupMax:      2 * time.Hour,
+		publishedAt:      "2026-11-19",
+	}
+	before := time.Date(2026, 11, 20, 14, 0, 0, 0, cst)
+	if delay := service.nextRefreshDelay(before); delay != 100*time.Minute {
+		t.Fatalf("pre-publication delay = %s, want 1h40m", delay)
+	}
+
+	after := time.Date(2026, 11, 20, 16, 0, 0, 0, cst)
+	want := []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 2 * time.Hour, 2 * time.Hour}
+	for i, expected := range want {
+		delay := service.nextRefreshDelay(after)
+		if delay != expected {
+			t.Fatalf("stale retry %d = %s, want %s", i+1, delay, expected)
+		}
+	}
+
+	service.mu.Lock()
+	service.publishedAt = "2026-11-20"
+	service.mu.Unlock()
+	if delay := service.nextRefreshDelay(after); delay != 23*time.Hour+40*time.Minute {
+		t.Fatalf("post-publication delay = %s, want 23h40m", delay)
+	}
+}
+
+func TestDUT1WeeklyBackoffForMirror(t *testing.T) {
+	service := &dut1Service{
+		scheduleKind:     "weekly",
+		scheduleLoc:      time.UTC,
+		scheduleWeekday:  time.Thursday,
+		scheduleHour:     17,
+		scheduleMinute:   40,
+		publicationGrace: 10 * time.Minute,
+		followupRetry:    15 * time.Minute,
+		followupMax:      6 * time.Hour,
+		publishedAt:      "2026-11-05",
+	}
+	now := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	if delay := service.nextRefreshDelay(now); delay != 15*time.Minute {
+		t.Fatalf("first mirror retry = %s, want 15m", delay)
+	}
+	if delay := service.nextRefreshDelay(now); delay != 30*time.Minute {
+		t.Fatalf("second mirror retry = %s, want 30m", delay)
+	}
+}
+
+func TestDUT1InfoStaleFollowsPublicationWindow(t *testing.T) {
+	now := time.Now().UTC()
+	service := &dut1Service{
+		points:           map[string]DUT1Point{},
+		source:           "IERS Bulletin A",
+		updatedAt:        now.Add(-48 * time.Hour),
+		staleAfter:       time.Hour,
+		publishedAt:      now.Format("2006-01-02"),
+		scheduleKind:     "daily",
+		scheduleLoc:      time.UTC,
+		scheduleHour:     0,
+		scheduleMinute:   0,
+		publicationGrace: 0,
+	}
+	if info := service.Info(now); info.Stale {
+		t.Fatal("current publication must remain fresh despite an old refresh timestamp")
+	}
+	service.mu.Lock()
+	service.publishedAt = now.AddDate(0, 0, -14).Format("2006-01-02")
+	service.mu.Unlock()
+	if info := service.Info(now); !info.Stale {
+		t.Fatal("stale publication must be reported as stale")
+	}
+}
+
 func TestRoundDUT1(t *testing.T) {
 	cases := []struct {
 		in   float64

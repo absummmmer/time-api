@@ -15,17 +15,29 @@ services:
       - TZ=UTC
       # Upstream EOP source. Supports a comma-separated fallback list.
       - DUT1_SOURCE_URL=https://datacenter.iers.org/data/latestVersion/bulletinA.txt
-      # Refresh the cache every 6 hours; retry failed fetches after 5 minutes.
+      # Baseline stale-age and fallback refresh interval; normal checks are publication-aware.
       - DUT1_REFRESH_INTERVAL=6h
       - DUT1_HTTP_TIMEOUT=30s
       - DUT1_STALE_AFTER=12h
+      # Publication-aware checks: IERS Bulletin A is expected weekly on
+      # Thursday around 17:40 UTC; NTSC's daily EOP file around 15:30 +08.
+      # If the expected file is late, retry at the first interval and double
+      # it up to the maximum, then align again to the next publication window.
+      - DUT1_IERS_PUBLICATION_WEEKDAY=4
+      - DUT1_IERS_PUBLICATION_TIME=17:40
+      - DUT1_IERS_FOLLOWUP_RETRY=15m
+      - DUT1_IERS_FOLLOWUP_MAX=6h
+      - DUT1_NTSC_PUBLICATION_TIME=15:30
+      - DUT1_NTSC_FOLLOWUP_RETRY=10m
+      - DUT1_NTSC_FOLLOWUP_MAX=2h
       # Persistent last-good snapshot used when upstreams are unreachable.
       - DUT1_CACHE_DIR=/data/dut1
       # Prefer the official IERS host; if it is unreachable, use NTSC's mirror
-      # of the same IERS Bulletin A files. Resolve the mirror at most daily.
+      # of the same IERS Bulletin A files. When the mirror publication is
+      # stale, retries use the same publication-aware backoff.
       - DUT1_IERS_MIRROR_ENABLED=true
       - DUT1_IERS_MIRROR_REFRESH_INTERVAL=24h
-      - DUT1_IERS_MIRROR_RETRY_INTERVAL=1h
+      - DUT1_IERS_MIRROR_RETRY_INTERVAL=15m
       # Independent NTSC EOP peer source (not an IERS backup). Refreshed daily;
       # the large EOP file is only downloaded when its file ID changes.
       - DUT1_NTSC_ENABLED=true
