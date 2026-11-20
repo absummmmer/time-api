@@ -403,10 +403,11 @@ func (s *dut1Service) start(ctx context.Context) {
 	s.LoadCache()
 	s.logger.Println("Initializing DUT1 service...")
 
+	now := time.Now().UTC()
 	delay := s.refresh
-	if s.cacheIsFresh(time.Now()) {
+	if s.cacheIsFresh(now) && !s.publicationStaleAt(now) {
 		age := s.cacheAge()
-		delay = s.nextRefreshDelay(time.Now().UTC())
+		delay = s.nextRefreshDelay(now)
 		if delay < time.Minute {
 			delay = time.Minute
 		}
@@ -416,6 +417,11 @@ func (s *dut1Service) start(ctx context.Context) {
 			"next_in":    delay.String(),
 		})
 	} else {
+		if s.cacheIsFresh(now) {
+			s.logger.Info("", "DUT1 publication is overdue; refreshing now", map[string]interface{}{
+				"source_key": s.sourceKey,
+			})
+		}
 		initCtx, cancel := context.WithTimeout(ctx, s.timeout)
 		err := s.refreshOnce(initCtx)
 		cancel()
