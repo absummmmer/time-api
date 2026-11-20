@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	timezone "github.com/tkuchiki/go-timezone"
@@ -149,6 +150,23 @@ var timezones []Timezone
 // dut1 is the process-wide DUT1 cache. It is initialised in main.
 var dut1 *dut1Service
 var dut1NTSC *dut1Service
+
+var dut1ManualRefreshMu sync.Mutex
+var dut1ManualRefreshLast = map[string]time.Time{}
+
+const dut1ManualRefreshGap = 10 * time.Second
+
+func reserveDUT1ManualRefresh(source string) bool {
+	dut1ManualRefreshMu.Lock()
+	defer dut1ManualRefreshMu.Unlock()
+	now := time.Now()
+	last := dut1ManualRefreshLast[source]
+	if !last.IsZero() && now.Sub(last) < dut1ManualRefreshGap {
+		return false
+	}
+	dut1ManualRefreshLast[source] = now
+	return true
+}
 
 func createTimeZoneList() {
 	tz := timezone.New()
@@ -295,6 +313,15 @@ const openAPISpec = `{
               "enum": ["auto", "ntsc", "iers"]
             },
             "description": "DUT1 source selection. Defaults to DUT1_DEFAULT_SOURCE or auto."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Fetch the selected upstream source immediately before returning DUT1. Rate-limited; use source=ntsc for the daily NTSC EOP product."
           }
         ],
         "responses": {

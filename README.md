@@ -195,7 +195,9 @@ GET /v1/dut1?date=2026-10-18&source=auto
 ```
 
 `date` is optional; the current UTC date is used when omitted. `source` accepts
-`auto` (default), `ntsc`, or `iers`. `auto` uses IERS Bulletin A. If the official
+`auto` (default), `ntsc`, or `iers`. Add `refresh=1` to fetch the selected
+source immediately before the response (rate-limited; use `source=ntsc` for
+the daily NTSC EOP product). `auto` uses IERS Bulletin A. If the official
 IERS host is unreachable, the same IERS product is fetched from NTSC's mirror of
 IERS Bulletin A; the response keeps `source_key: "iers"` and labels the mirror in
 `source`. The NTSC EOP product is an independent peer source, not an automatic

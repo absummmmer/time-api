@@ -489,6 +489,78 @@ func TestNTSCSkipsUnchangedFileDownload(t *testing.T) {
 	}
 }
 
+func TestManualDUT1Refresh(t *testing.T) {
+	const ntsc = `# NTSC EOP example
+2026 11 2 61346 0.136114 0.317750 -0.0556760 0.0010051 0.000345 0.000000 0.999 0.999 0.999 0.999 0.999 0.999
+2026 11 3 61347 0.134247 0.317549 -0.0568139 0.0011433 0.000342 0.000000 0.999 0.999 0.999 0.999 0.999 0.999
+`
+	var downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ftpFile/findDataList":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"code":0,"data":[{"id":42,"fileName":"NTSC_EOP_20261103","createTime":"2026-11-03 15:30:00"}]}`)
+		case "/ftpFile/download":
+			downloads.Add(1)
+			_, _ = io.WriteString(w, ntsc)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	oldIERS, oldNTSC := dut1, dut1NTSC
+	oldLogger := Logger
+	defer func() {
+		dut1, dut1NTSC = oldIERS, oldNTSC
+		Logger = oldLogger
+		dut1ManualRefreshMu.Lock()
+		dut1ManualRefreshLast = map[string]time.Time{}
+		dut1ManualRefreshMu.Unlock()
+	}()
+	Logger = NewJSONLogger(io.Discard)
+	dut1 = nil
+	dut1NTSC = &dut1Service{
+		mode:        "ntsc",
+		sourceKey:   "ntsc",
+		ntscBaseURL: server.URL,
+		client:      server.Client(),
+		logger:      NewJSONLogger(io.Discard),
+	}
+	dut1ManualRefreshMu.Lock()
+	dut1ManualRefreshLast = map[string]time.Time{}
+	dut1ManualRefreshMu.Unlock()
+
+	request := httptest.NewRequest("GET", "/v1/dut1?source=ntsc&refresh=1", nil)
+	recorder := httptest.NewRecorder()
+	dut1V1Handler(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("manual refresh status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if downloads.Load() != 1 {
+		t.Fatalf("manual refresh downloaded %d files, want 1", downloads.Load())
+	}
+
+	request = httptest.NewRequest("GET", "/v1/dut1?source=ntsc&refresh=1", nil)
+	recorder = httptest.NewRecorder()
+	dut1V1Handler(recorder, request)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("second manual refresh status = %d, want 429", recorder.Code)
+	}
+	if downloads.Load() != 1 {
+		t.Fatalf("rate-limited refresh performed another download")
+	}
+}
+
+func TestManualDUT1RefreshRejectsInvalidFlag(t *testing.T) {
+	request := httptest.NewRequest("GET", "/v1/dut1?refresh=maybe", nil)
+	recorder := httptest.NewRecorder()
+	dut1V1Handler(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid refresh status = %d, want 400", recorder.Code)
+	}
+}
+
 func TestDUT1PublicationSchedule(t *testing.T) {
 	cst := time.FixedZone("CST", 8*60*60)
 	daily := &dut1Service{

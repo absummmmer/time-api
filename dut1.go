@@ -135,6 +135,7 @@ type dut1Service struct {
 	followupMax      time.Duration
 	followupAttempt  int
 	scheduleTarget   time.Time
+	refreshMu        sync.Mutex
 
 	startOnce      sync.Once
 	ntscLatestID   int
@@ -453,6 +454,8 @@ func (s *dut1Service) run(ctx context.Context, delay time.Duration) {
 }
 
 func (s *dut1Service) refreshOnce(ctx context.Context) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	if s.mode == "ntsc" {
 		return s.refreshNTSC(ctx)
 	}
@@ -1375,6 +1378,50 @@ func dut1V1Handler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid source, expected auto, ntsc, or iers"})
 		return
+	}
+	refresh := false
+	if rawRefresh := strings.TrimSpace(r.URL.Query().Get("refresh")); rawRefresh != "" {
+		parsed, err := strconv.ParseBool(rawRefresh)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid refresh value"})
+			return
+		}
+		refresh = parsed
+	}
+	if refresh {
+		if !reserveDUT1ManualRefresh(mode) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "DUT1 refresh is rate limited; retry in a few seconds"})
+			return
+		}
+		var service *dut1Service
+		switch mode {
+		case "ntsc":
+			service = dut1NTSC
+		case "iers":
+			service = dut1
+		default:
+			service = dut1
+			if service == nil {
+				service = dut1NTSC
+			}
+		}
+		if service == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "DUT1 source is not available"})
+			return
+		}
+		refreshCtx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		err := service.refreshOnce(refreshCtx)
+		cancel()
+		if err != nil {
+			Logger.Printf("[%s] Manual DUT1 refresh failed (source=%s): %v", requestID, mode, err)
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "DUT1 refresh failed: " + err.Error()})
+			return
+		}
+		Logger.Printf("[%s] Manual DUT1 refresh completed (source=%s)", requestID, mode)
 	}
 
 	info := dut1InfoFor(at, mode)
