@@ -118,7 +118,13 @@ GET /v1/time/ntp
 ```
 
 The response includes `server_received_unix_us`, `server_sent_unix_us`, the
-corresponding millisecond fields, a `sequence` number, and `clock_health`:
+corresponding millisecond fields, a `sequence` number, and `clock_health`.
+The receive, send, processing, and sequence values are also returned as
+`X-Time-Server-Received-Unix-Us`, `X-Time-Server-Sent-Unix-Us`,
+`X-Time-Server-Processing-Us`, and `X-Time-Sequence` response headers, exposed
+via CORS. A browser that takes its final timestamp as soon as headers arrive can
+exclude the JSON body download from the four-timestamp path estimate; older
+deployments without these headers still use the body values.
 
 ```json
 {

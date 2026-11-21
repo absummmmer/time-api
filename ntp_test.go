@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -158,6 +159,25 @@ func TestNTPTimeHandlerShape(t *testing.T) {
 	}
 	if response.ServerReceivedUnixUs != response.HostReceivedUnixUs {
 		t.Fatal("server timestamp should equal host timestamp without correction")
+	}
+	headerReceived, err := strconv.ParseInt(recorder.Header().Get("X-Time-Server-Received-Unix-Us"), 10, 64)
+	if err != nil {
+		t.Fatalf("missing/invalid receive header: %v", err)
+	}
+	headerSent, err := strconv.ParseInt(recorder.Header().Get("X-Time-Server-Sent-Unix-Us"), 10, 64)
+	if err != nil {
+		t.Fatalf("missing/invalid send header: %v", err)
+	}
+	processing, err := strconv.ParseInt(recorder.Header().Get("X-Time-Server-Processing-Us"), 10, 64)
+	if err != nil || processing < 0 {
+		t.Fatalf("missing/invalid processing header: %v / %d", err, processing)
+	}
+	if headerReceived != response.ServerReceivedUnixUs || headerSent != response.ServerSentUnixUs {
+		t.Fatalf("body/header timestamps differ: body=%d/%d header=%d/%d",
+			response.ServerReceivedUnixUs, response.ServerSentUnixUs, headerReceived, headerSent)
+	}
+	if headerSent < headerReceived {
+		t.Fatalf("header send before receive: %d < %d", headerSent, headerReceived)
 	}
 }
 

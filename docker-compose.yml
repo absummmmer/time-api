@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     ports:
       # Host port is configurable; default 8080.
-      - "${TIME_API_PORT:-8080}:8080"
+      - "8088:8080"
     volumes:
       # Last-good DUT1 data survives container restarts/recreates.
       - dut1-cache:/data/dut1
@@ -51,7 +51,7 @@ services:
       - NTP_MONITOR_ENABLED=true
       # Priority order, comma-separated. NTSC stays first; the rest are
       # fallback/health sources when the primary path is unusable.
-      - NTP_MONITOR_SERVERS=ntp.ntsc.ac.cn,ntp.aliyun.com,pool.ntp.org,time.apple.com
+      - NTP_MONITOR_SERVERS=ntp.aliyun.com,ntp.tencent.com,cn.pool.ntp.org,ntp.ntsc.ac.cn,pool.ntp.org,time.nist.gov,time.windows.com,time.apple.com
       - NTP_MONITOR_INTERVAL=5m
       - NTP_MONITOR_TIMEOUT=3s
       - NTP_MONITOR_HOLDOVER_AFTER=20m

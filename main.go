@@ -1025,6 +1025,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Time-Server-Received-Unix-Us, X-Time-Server-Sent-Unix-Us, X-Time-Server-Processing-Us, X-Time-Sequence")
 		}
 		next(w, r)
 	}

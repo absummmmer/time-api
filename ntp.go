@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -519,6 +520,10 @@ func ntpProbeTimeout() time.Duration {
 func ntpTimeV1Handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	// Take the request-arrival stamp before any NTP monitor or response work.
+	// The send stamp is taken after JSON marshaling, just before headers/body
+	// are written; the precision-critical values are also exposed as headers.
+	receivedAt := time.Now().UTC()
 	probeServer := strings.TrimSpace(r.URL.Query().Get("server"))
 	probe := probeServer != ""
 	refresh := false
@@ -565,8 +570,7 @@ func ntpTimeV1Handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	hostReceived := time.Now().UTC()
-	hostSent := time.Now().UTC()
+	hostReceived := receivedAt
 	decision := decideNTPServerCorrection(health, correctionMode())
 	if probe {
 		// A ?server= request is diagnostic only. It must not apply a correction
@@ -583,7 +587,6 @@ func ntpTimeV1Handler(w http.ResponseWriter, r *http.Request) {
 		correctionUs = int64(math.Round(correctionMs * 1000))
 	}
 	serverReceivedUs := hostReceived.UnixMicro() + correctionUs
-	serverSentUs := hostSent.UnixMicro() + correctionUs
 	serverDate := time.UnixMicro(serverReceivedUs).UTC()
 	clockSource := "host"
 	if correctionApplied {
@@ -592,13 +595,13 @@ func ntpTimeV1Handler(w http.ResponseWriter, r *http.Request) {
 	response := NTPTimeResponse{
 		Sequence:                     atomic.AddUint64(&ntpTimeSequence, 1),
 		ServerReceivedUnixUs:         serverReceivedUs,
-		ServerSentUnixUs:             serverSentUs,
+		ServerSentUnixUs:             0,
 		ServerReceivedMs:             serverReceivedUs / 1000,
-		ServerSentMs:                 serverSentUs / 1000,
+		ServerSentMs:                 0,
 		HostReceivedUnixUs:           hostReceived.UnixMicro(),
-		HostSentUnixUs:               hostSent.UnixMicro(),
+		HostSentUnixUs:               0,
 		HostReceivedMs:               hostReceived.UnixMilli(),
-		HostSentMs:                   hostSent.UnixMilli(),
+		HostSentMs:                   0,
 		ClockCorrectionMs:            correctionMs,
 		ClockCorrectionApplied:       correctionApplied,
 		ClockCorrectionEligible:      decision.Eligible,
@@ -613,8 +616,31 @@ func ntpTimeV1Handler(w http.ResponseWriter, r *http.Request) {
 		Refreshed:                    refresh,
 		ClockHealth:                  health,
 	}
-	if err := json.NewEncoder(w).Encode(response); err != nil {
+	body, err := json.Marshal(response)
+	if err != nil {
 		Logger.Error("", "NTP time response encode failed", map[string]any{"error": err.Error()})
+		return
+	}
+	sentAt := time.Now().UTC()
+	serverSentUs := sentAt.UnixMicro() + correctionUs
+	hostSentUs := sentAt.UnixMicro()
+	body = bytes.Replace(body, []byte(`"server_sent_unix_us":0`),
+		[]byte(fmt.Sprintf(`"server_sent_unix_us":%d`, serverSentUs)), 1)
+	body = bytes.Replace(body, []byte(`"server_sent_ms":0`),
+		[]byte(fmt.Sprintf(`"server_sent_ms":%d`, serverSentUs/1000)), 1)
+	body = bytes.Replace(body, []byte(`"host_sent_unix_us":0`),
+		[]byte(fmt.Sprintf(`"host_sent_unix_us":%d`, hostSentUs)), 1)
+	body = bytes.Replace(body, []byte(`"host_sent_ms":0`),
+		[]byte(fmt.Sprintf(`"host_sent_ms":%d`, hostSentUs/1000)), 1)
+	processingUs := sentAt.Sub(hostReceived).Microseconds()
+	w.Header().Set("X-Time-Server-Received-Unix-Us", strconv.FormatInt(serverReceivedUs, 10))
+	w.Header().Set("X-Time-Server-Sent-Unix-Us", strconv.FormatInt(serverSentUs, 10))
+	w.Header().Set("X-Time-Server-Processing-Us", strconv.FormatInt(processingUs, 10))
+	w.Header().Set("X-Time-Sequence", strconv.FormatUint(response.Sequence, 10))
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		Logger.Error("", "NTP time response write failed", map[string]any{"error": err.Error()})
 	}
 }
 
