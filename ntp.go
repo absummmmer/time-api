@@ -70,6 +70,8 @@ type ntpSourceState struct {
 	lastSuccess         time.Time
 	consecutiveFailures int
 	reach               uint8
+	lastHealth          NTPSourceHealth
+	hasLastHealth       bool
 }
 
 func (s *ntpSourceState) record(success bool, at time.Time) {
@@ -124,9 +126,10 @@ type ntpQueryResult struct {
 }
 
 type ntpCandidate struct {
-	server string
-	index  int
-	result ntpQueryResult
+	server  string
+	index   int
+	attempt time.Time
+	result  ntpQueryResult
 }
 
 // selectNTPCandidate follows the configured priority order. It first prefers a
@@ -761,7 +764,9 @@ func (m *NTPMonitor) Start(ctx context.Context) {
 		"correction":     m.correctionMode,
 	})
 	go func() {
-		m.runOnce()
+		// Populate all sources once immediately, then keep their polling phases
+		// staggered so LastRx does not collapse to one shared age.
+		m.runOnce(false)
 		ticker := time.NewTicker(m.interval)
 		defer ticker.Stop()
 		for {
@@ -769,28 +774,43 @@ func (m *NTPMonitor) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.runOnce()
+				m.runOnce(true)
 			}
 		}
 	}()
 }
 
 type ntpServerOutcome struct {
-	index  int
-	server string
-	result ntpQueryResult
-	err    error
+	index   int
+	server  string
+	attempt time.Time
+	result  ntpQueryResult
+	err     error
 }
 
-func (m *NTPMonitor) queryAll() []ntpServerOutcome {
+func (m *NTPMonitor) queryAll(stagger bool) []ntpServerOutcome {
+	var staggerDelay time.Duration
+	if stagger && len(m.servers) > 1 {
+		staggerDelay = m.interval / time.Duration(len(m.servers))
+		if staggerDelay > 30*time.Second {
+			staggerDelay = 30 * time.Second
+		}
+		if staggerDelay < time.Second {
+			staggerDelay = time.Second
+		}
+	}
 	ch := make(chan ntpServerOutcome, len(m.servers))
 	var wg sync.WaitGroup
 	for index, server := range m.servers {
 		wg.Add(1)
 		go func(index int, server string) {
 			defer wg.Done()
+			if stagger && staggerDelay > 0 && index > 0 {
+				time.Sleep(time.Duration(index) * staggerDelay)
+			}
+			attempt := time.Now().UTC()
 			result, err := queryNTPServer(server, m.timeout)
-			ch <- ntpServerOutcome{index: index, server: server, result: result, err: err}
+			ch <- ntpServerOutcome{index: index, server: server, attempt: attempt, result: result, err: err}
 		}(index, server)
 	}
 	go func() {
@@ -805,16 +825,18 @@ func (m *NTPMonitor) queryAll() []ntpServerOutcome {
 	return outcomes
 }
 
-func (m *NTPMonitor) runOnce() {
+func (m *NTPMonitor) runOnce(stagger bool) {
 	m.queryMu.Lock()
 	defer m.queryMu.Unlock()
 	attempt := time.Now().UTC()
 
-	outcomes := m.queryAll()
+	outcomes := m.queryAll(stagger)
+	attemptByServer := make(map[string]time.Time, len(outcomes))
 	candidates := make([]ntpCandidate, 0, len(outcomes))
 	sources := make([]NTPSourceHealth, 0, len(outcomes))
 	failures := make([]string, 0, len(outcomes))
 	for _, outcome := range outcomes {
+		attemptByServer[outcome.server] = outcome.attempt
 		source := NTPSourceHealth{Server: outcome.server}
 		if outcome.err != nil {
 			source.Error = outcome.err.Error()
@@ -836,9 +858,10 @@ func (m *NTPMonitor) runOnce() {
 			source.RootDispersionMs = outcome.result.RootDispersionMs
 			source.Leap = outcome.result.Leap
 			candidates = append(candidates, ntpCandidate{
-				server: outcome.server,
-				index:  outcome.index,
-				result: outcome.result,
+				server:  outcome.server,
+				index:   outcome.index,
+				attempt: outcome.attempt,
+				result:  outcome.result,
 			})
 		}
 		sources = append(sources, source)
@@ -862,13 +885,31 @@ func (m *NTPMonitor) runOnce() {
 			state = &ntpSourceState{}
 			m.sourceStates[sources[index].Server] = state
 		}
-		state.record(sources[index].Reachable, attempt)
+		if !sources[index].Reachable && state.hasLastHealth {
+			// Keep the last successful values visible while the source is down;
+			// the UI marks the row unreachable and shows the growing LastRx age.
+			previous := state.lastHealth
+			previous.Server = sources[index].Server
+			previous.Reachable = false
+			previous.Selected = false
+			previous.Error = sources[index].Error
+			sources[index] = previous
+		}
+		sourceAttempt := attempt
+		if candidateAttempt, ok := attemptByServer[sources[index].Server]; ok {
+			sourceAttempt = candidateAttempt
+		}
+		state.record(sources[index].Reachable, sourceAttempt)
 		sources[index].ConsecutiveFailures = state.consecutiveFailures
 		sources[index].Reach = int(state.reach)
 		sources[index].ReachOctal = fmt.Sprintf("%03o", state.reach)
 		sources[index].LastAttemptAt = state.lastAttempt.Format(time.RFC3339Nano)
 		if !state.lastSuccess.IsZero() {
 			sources[index].LastSuccessAt = state.lastSuccess.Format(time.RFC3339Nano)
+		}
+		if sources[index].Reachable {
+			state.lastHealth = sources[index]
+			state.hasLastHealth = true
 		}
 	}
 	m.sources = sources
@@ -880,7 +921,7 @@ func (m *NTPMonitor) runOnce() {
 
 	result := selected.result
 	m.reachable = true
-	m.lastSuccess = attempt
+	m.lastSuccess = selected.attempt
 	m.lastError = ""
 	m.server = selected.server
 	m.fallback = selected.index > 0
@@ -915,7 +956,7 @@ func (m *NTPMonitor) RefreshNow() NTPHealth {
 	if !m.enabled {
 		return m.Status()
 	}
-	m.runOnce()
+	m.runOnce(false)
 	return m.Status()
 }
 
